@@ -5,8 +5,9 @@ on:
   workflow_dispatch:
     inputs:
       board:
-        description: '板子名，例如 atoms3r-cam-m12-echo-base'
+        description: '板子名（默认 esp-sparkbot）'
         required: true
+        default: 'esp-sparkbot'
 
 jobs:
   build:
