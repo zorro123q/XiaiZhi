@@ -89,7 +89,7 @@ void McpServer::AddCommonTools() {
     auto camera = board.GetCamera();
     if (camera) {
         // 本地人脸识别服务地址：改成你运行 face_server.py 那台电脑的局域网 IP
-        camera->SetFaceRecognizeUrl("http://192.168.1.100:8001/recognize");
+        camera->SetFaceRecognizeUrl("http://192.168.100.230:8001/recognize");
 
         AddTool("self.camera.take_photo",
             "Take a photo and explain it. Use this tool after the user asks you to see something.\n"
