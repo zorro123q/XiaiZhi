@@ -31,8 +31,10 @@ dependencies:
   lvgl/lvgl: ~9.3.0
   esp_lvgl_port: ~2.6.0
   espressif/esp_io_expander_tca95xx_16bit: ^2.0.0
-  espressif2022/image_player: ==1.1.0~1
-  espressif2022/esp_emote_gfx: ==1.0.0~2
+  # 原约束 ==1.1.0~1 / ==1.0.0~2 对应的版本已被官方仓库撤回，改用可用版本
+  # 仅 ESP-HI / ECHOEAR 板子用到这两个组件，esp-sparkbot 不依赖
+  espressif2022/image_player: ^1.1.0
+  espressif2022/esp_emote_gfx: ^3.0.0
   espressif/adc_mic: ^0.2.1
   espressif/esp_mmap_assets: '>=1.2'
   txp666/otto-emoji-gif-component: ~1.0.2
