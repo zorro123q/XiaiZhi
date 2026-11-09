@@ -17,3 +17,12 @@ main/mmap_generate_emoji.h
 *.pyc
 *.bin
 mmap_generate_*.h
+
+# 本地工作日志（不要公开）
+.workbuddy/
+
+# 人脸生物特征数据（不要公开）
+face_service/photos/
+face_service/face_db.json
+face_service/.venv/
+
