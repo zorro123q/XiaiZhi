@@ -1,6 +1,7 @@
 name: Build My Board
 
 # 手动触发：Actions 页面点 Run workflow，填板子名
+# 推送触发：只针对 sparkbot-ws-remote 分支，用来验证遥控改动是否真能编过
 on:
   workflow_dispatch:
     inputs:
@@ -8,12 +9,17 @@ on:
         description: '板子名（默认 esp-sparkbot）'
         required: true
         default: 'esp-sparkbot'
+  push:
+    branches:
+      - sparkbot-ws-remote
 
 jobs:
   build:
     runs-on: ubuntu-latest
     container:
       image: espressif/idf:release-v5.4
+    env:
+      BOARD: ${{ inputs.board || 'esp-sparkbot' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -22,11 +28,11 @@ jobs:
         shell: bash
         run: |
           source $IDF_PATH/export.sh
-          python scripts/release.py ${{ inputs.board }}
+          python scripts/release.py "$BOARD"
 
       - name: Upload merged bin
         uses: actions/upload-artifact@v4
         with:
-          name: xiaozhi-${{ inputs.board }}-merged
+          name: xiaozhi-${{ env.BOARD }}-merged
           path: build/merged-binary.bin
           if-no-files-found: error

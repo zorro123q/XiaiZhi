@@ -161,7 +161,7 @@ private:
         camera_config.pixel_format = PIXFORMAT_RGB565;
         camera_config.frame_size = FRAMESIZE_240X240;
         camera_config.jpeg_quality = 12;
-        camera_config.fb_count = 1;
+        camera_config.fb_count = 2;
         camera_config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
         
         camera_ = new Esp32Camera(camera_config);

@@ -3,6 +3,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
+#include <cmath>
+#include <new>
+#include <esp_timer.h>
+#include <lwip/sockets.h>
 
 #include <esp_log.h>
 #include <esp_wifi.h>
@@ -15,6 +20,19 @@
 static const char* TAG = "wifi_remote";
 
 static httpd_handle_t s_server = nullptr;
+static std::atomic<bool> s_stream_running{false};
+static std::atomic<bool> s_stream_active{false};
+static std::atomic<bool> s_frame_pending{false};
+static std::atomic<uint32_t> s_session{0};
+static uint32_t s_next_session = 0;
+static int s_client_fd = -1;
+static int64_t s_last_seen = 0;
+
+struct VideoFrame {
+    uint32_t session;
+    uint8_t* data;
+    size_t len;
+};
 static std::function<void(const std::string&)> s_send;
 static WifiRemoteControl::CaptureJpegFn s_capture_jpeg;
 
@@ -51,7 +69,7 @@ h1{font-size:14px;font-weight:500;color:#8b949e;margin:0;letter-spacing:2px}
 #flips button.on{color:#58a6ff;border-color:#1f6feb}
 </style></head><body>
 <h1>SPARKBOT 遥控</h1>
-<div id="view"><img id="cam" src="/stream" alt="camera"></div>
+<div id="view"><img id="cam" alt="camera"></div>
 <div id="flips">
   <button id="fh" onclick="toggleH()">左右翻转</button>
   <button id="fv" onclick="toggleV()">上下翻转</button>
@@ -61,7 +79,8 @@ h1{font-size:14px;font-weight:500;color:#8b949e;margin:0;letter-spacing:2px}
 <div id="hint">拖动摇杆控制 · 松手停止</div>
 <script>
 var pad=document.getElementById('pad'),knob=document.getElementById('knob'),
-    val=document.getElementById('val'),dragging=false,last=0;
+    val=document.getElementById('val'),hint=document.getElementById('hint'),
+    dragging=false,last=0,currentX=0,currentY=0,pointerId=null;
 function stickR(){return pad.clientWidth/2-8;}
 var cam=document.getElementById('cam'),fhOn=true,fvOn=false;
 function applyFlip(){
@@ -72,28 +91,68 @@ function applyFlip(){
 function toggleH(){fhOn=!fhOn;applyFlip();}
 function toggleV(){fvOn=!fvOn;applyFlip();}
 applyFlip();
-function send(x,y){fetch('/ctrl?x='+x.toFixed(2)+'&y='+y.toFixed(2)).catch(function(){});}
-function sendStop(){fetch('/stop').catch(function(){});}
+var ws=null,imageUrl=null,imageBusy=false;
+cam.onload=cam.onerror=function(){imageBusy=false;};
+function send(x,y){
+  if(ws&&ws.readyState===WebSocket.OPEN&&ws.bufferedAmount===0)
+    ws.send('x'+x.toFixed(2)+'y'+y.toFixed(2));
+}
+function sendStop(){
+  if(ws&&ws.readyState===WebSocket.OPEN)ws.send('x0y0');
+}
+function resetStick(){
+  dragging=false;pointerId=null;currentX=0;currentY=0;
+  knob.style.transform='translate(0,0)';val.textContent='x 0.00   y 0.00';
+}
+function release(){resetStick();sendStop();}
+function connect(){
+  ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
+  ws.onopen=function(){resetStick();sendStop();hint.textContent='已连接 · 拖动摇杆控制 · 松手停止';};
+  ws.onmessage=function(event){
+    if(typeof event.data==='string'||imageBusy)return;
+    var previous=imageUrl;
+    imageUrl=URL.createObjectURL(new Blob([event.data],{type:'image/jpeg'}));
+    imageBusy=true;cam.src=imageUrl;
+    if(previous)URL.revokeObjectURL(previous);
+  };
+  ws.onerror=function(){ws.close();};
+  ws.onclose=function(){
+    resetStick();imageBusy=false;
+    if(imageUrl){URL.revokeObjectURL(imageUrl);imageUrl=null;}
+    hint.textContent='连接断开，正在重连…';setTimeout(connect,1000);
+  };
+}
+connect();
+setInterval(function(){if(dragging)send(currentX,currentY);},150);
+setInterval(function(){
+  if(ws&&ws.readyState===WebSocket.OPEN&&ws.bufferedAmount===0)ws.send('PING');
+},1000);
 function handle(cx,cy){
-  var r=pad.getBoundingClientRect();
-  var R=stickR();
+  var r=pad.getBoundingClientRect(),R=stickR();
   var dx=cx-(r.left+r.width/2),dy=cy-(r.top+r.height/2);
   var d=Math.sqrt(dx*dx+dy*dy);
   if(d>R){dx=dx/d*R;dy=dy/d*R;}
   knob.style.transform='translate('+dx+'px,'+dy+'px)';
-  var x=dx/R,y=-dy/R;
-  val.textContent='x '+x.toFixed(2)+'   y '+y.toFixed(2);
+  currentX=dx/R;currentY=-dy/R;
+  val.textContent='x '+currentX.toFixed(2)+'   y '+currentY.toFixed(2);
   var now=performance.now();
-  if(now-last>150){last=now;send(x,y);}
+  if(now-last>150){last=now;send(currentX,currentY);}
 }
-pad.addEventListener('pointerdown',function(e){dragging=true;
+pad.addEventListener('pointerdown',function(e){
+  if(dragging||!ws||ws.readyState!==WebSocket.OPEN)return;
+  dragging=true;pointerId=e.pointerId;
   if(pad.setPointerCapture)pad.setPointerCapture(e.pointerId);
-  handle(e.clientX,e.clientY);});
-pad.addEventListener('pointermove',function(e){if(dragging)handle(e.clientX,e.clientY);});
-pad.addEventListener('pointerup',function(){dragging=false;
-  knob.style.transform='translate(0,0)';val.textContent='x 0.00   y 0.00';sendStop();});
-pad.addEventListener('pointercancel',function(){dragging=false;
-  knob.style.transform='translate(0,0)';sendStop();});
+  handle(e.clientX,e.clientY);
+});
+pad.addEventListener('pointermove',function(e){
+  if(dragging&&e.pointerId===pointerId)handle(e.clientX,e.clientY);
+});
+['pointerup','pointercancel','lostpointercapture'].forEach(function(name){
+  pad.addEventListener(name,function(e){if(e.pointerId===pointerId)release();});
+});
+window.addEventListener('blur',release);
+window.addEventListener('pagehide',release);
+document.addEventListener('visibilitychange',function(){if(document.hidden)release();});
 </script></body></html>)HTML";
 
 // ---------------------------------------------------------------------------
@@ -105,121 +164,140 @@ static esp_err_t root_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
-static esp_err_t ctrl_handler(httpd_req_t* req) {
-    char query[80] = {0}, xbuf[16] = {0}, ybuf[16] = {0};
-    if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
-        httpd_query_key_value(query, "x", xbuf, sizeof(xbuf)) == ESP_OK &&
-        httpd_query_key_value(query, "y", ybuf, sizeof(ybuf)) == ESP_OK) {
-        char cmd[48];
-        // 末尾加 \n：底盘按行区分指令，否则连续发送会粘包，sscanf 只解析第一条
-        snprintf(cmd, sizeof(cmd), "x%s y%s\n", xbuf, ybuf);
-        if (s_send) {
-            s_send(cmd);
-        }
-    }
-    httpd_resp_send(req, "ok", 2);
-    return ESP_OK;
+static void disconnect_client() {
+    s_session.store(0);
+    s_client_fd = -1;
+    if (s_send) s_send("x0y0");
 }
 
-static esp_err_t stop_handler(httpd_req_t* req) {
-    if (s_send) {
-        s_send("x0.0 y0.0");
-    }
-    httpd_resp_send(req, "stopped", 7);
-    return ESP_OK;
+static void close_client(httpd_handle_t server, int fd) {
+    if (fd == s_client_fd) disconnect_client();
+    close(fd);
 }
 
-// MJPEG 视频流：浏览器用 <img src="/stream"> 直接显示
-static esp_err_t stream_handler(httpd_req_t* req) {
-    if (!s_capture_jpeg) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "camera not available");
+static esp_err_t ws_handler(httpd_req_t* req) {
+    int fd = httpd_req_to_sockfd(req);
+    if (req->method == HTTP_GET) {
+        if (s_client_fd != -1) return ESP_FAIL;
+        s_client_fd = fd;
+        s_last_seen = esp_timer_get_time();
+        if (++s_next_session == 0) ++s_next_session;
+        s_session.store(s_next_session);
+        ESP_LOGI(TAG, "WebSocket control connected");
         return ESP_OK;
     }
-    httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    if (fd != s_client_fd) return ESP_FAIL;
+    httpd_ws_frame_t packet = {};
+    esp_err_t err = httpd_ws_recv_frame(req, &packet, 0);
+    if (err != ESP_OK) return err;
+    if (packet.type != HTTPD_WS_TYPE_TEXT || packet.len == 0 || packet.len >= 48)
+        return ESP_FAIL;
+    char text[48] = {};
+    packet.payload = reinterpret_cast<uint8_t*>(text);
+    err = httpd_ws_recv_frame(req, &packet, sizeof(text) - 1);
+    if (err != ESP_OK) return err;
+    if (strcmp(text, "PING") == 0) {
+        s_last_seen = esp_timer_get_time();
+        return ESP_OK;
+    }
+    float x = 0, y = 0;
+    char trailing = 0;
+    if (sscanf(text, "x%f y%f %c", &x, &y, &trailing) != 2 ||
+        !std::isfinite(x) || !std::isfinite(y) || fabsf(x) > 1 || fabsf(y) > 1)
+        return ESP_FAIL;
+    s_last_seen = esp_timer_get_time();
+    if (s_send) s_send(text);
+    return ESP_OK;
+}
 
-    int consecutive_fail = 0;
-    while (true) {
-        size_t len = 0;
-        uint8_t* jpg = s_capture_jpeg(&len);
-        if (jpg == nullptr || len == 0) {
-            if (jpg != nullptr) {
-                free(jpg);
-            }
-            // 连续取不到帧就退出，否则永久占用 socket，导致 /ctrl 被拒
-            if (++consecutive_fail > 30) {
-                ESP_LOGW(TAG, "stream: no frame for ~6s, closing connection");
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(200));
-            continue;
-        }
-        consecutive_fail = 0;
-
-        char head[96];
-        int head_len = snprintf(head, sizeof(head),
-                                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
-                                static_cast<unsigned>(len));
-        esp_err_t err = httpd_resp_send_chunk(req, head, head_len);
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, reinterpret_cast<const char*>(jpg), len);
-        }
-        free(jpg);
-        if (err == ESP_OK) {
-            err = httpd_resp_send_chunk(req, "\r\n", 2);
+// HTTP 任务只发送已编码的单帧；取帧和 JPEG 编码在独立任务中完成。
+static void send_video_frame(void* arg) {
+    auto* frame = static_cast<VideoFrame*>(arg);
+    if (s_stream_running.load() && frame->session == s_session.load() && s_client_fd >= 0) {
+        esp_err_t err = ESP_OK;
+        if (esp_timer_get_time() - s_last_seen > 5000000) {
+            err = ESP_FAIL;
+        } else if (frame->data != nullptr && frame->len > 0) {
+            httpd_ws_frame_t packet = {};
+            packet.type = HTTPD_WS_TYPE_BINARY;
+            packet.payload = frame->data;
+            packet.len = frame->len;
+            err = httpd_ws_send_frame_async(s_server, s_client_fd, &packet);
         }
         if (err != ESP_OK) {
-            break;  // 手机端已断开
+            int fd = s_client_fd;
+            disconnect_client();
+            shutdown(fd, SHUT_RDWR);
         }
-        vTaskDelay(pdMS_TO_TICKS(150));  // 约 6-7fps，降低 CPU 与摄像头压力
     }
-    return ESP_OK;
+    free(frame->data);
+    delete frame;
+    s_frame_pending.store(false);
+}
+
+static void stream_task(void*) {
+    while (s_stream_running.load()) {
+        uint32_t session = s_session.load();
+        if (session != 0 && !s_frame_pending.load()) {
+            auto* frame = new (std::nothrow) VideoFrame{session, nullptr, 0};
+            if (frame != nullptr) {
+                if (s_capture_jpeg) frame->data = s_capture_jpeg(&frame->len);
+                s_frame_pending.store(true);
+                if (!s_stream_running.load() || httpd_queue_work(s_server, send_video_frame, frame) != ESP_OK) {
+                    free(frame->data);
+                    delete frame;
+                    s_frame_pending.store(false);
+                }
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(150));
+    }
+    s_stream_active.store(false);
+    vTaskDelete(nullptr);
 }
 
 static void start_httpd() {
-    if (s_server != nullptr) {
-        return;
-    }
+    if (s_server != nullptr) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
-    cfg.max_open_sockets = 7;  // 留足余量：/stream 长连接会常驻占一个
+    cfg.max_open_sockets = 3;
     cfg.lru_purge_enable = true;
-
+    cfg.send_wait_timeout = 1;
+    cfg.recv_wait_timeout = 1;
+    cfg.close_fn = close_client;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
         ESP_LOGE(TAG, "httpd_start failed");
         s_server = nullptr;
         return;
     }
-
-    httpd_uri_t u_root = {};
-    u_root.uri = "/";
-    u_root.method = HTTP_GET;
-    u_root.handler = root_handler;
-    u_root.user_ctx = nullptr;
-    httpd_register_uri_handler(s_server, &u_root);
-
-    httpd_uri_t u_ctrl = {};
-    u_ctrl.uri = "/ctrl";
-    u_ctrl.method = HTTP_GET;
-    u_ctrl.handler = ctrl_handler;
-    u_ctrl.user_ctx = nullptr;
-    httpd_register_uri_handler(s_server, &u_ctrl);
-
-    httpd_uri_t u_stop = {};
-    u_stop.uri = "/stop";
-    u_stop.method = HTTP_GET;
-    u_stop.handler = stop_handler;
-    u_stop.user_ctx = nullptr;
-    httpd_register_uri_handler(s_server, &u_stop);
-
-    httpd_uri_t u_stream = {};
-    u_stream.uri = "/stream";
-    u_stream.method = HTTP_GET;
-    u_stream.handler = stream_handler;
-    u_stream.user_ctx = nullptr;
-    httpd_register_uri_handler(s_server, &u_stream);
-
-    ESP_LOGI(TAG, "httpd started on port 80");
+    httpd_uri_t root = {};
+    root.uri = "/";
+    root.method = HTTP_GET;
+    root.handler = root_handler;
+    httpd_uri_t ws = {};
+    ws.uri = "/ws";
+    ws.method = HTTP_GET;
+    ws.handler = ws_handler;
+    ws.is_websocket = true;
+    if (httpd_register_uri_handler(s_server, &root) != ESP_OK ||
+        httpd_register_uri_handler(s_server, &ws) != ESP_OK) {
+        httpd_stop(s_server);
+        s_server = nullptr;
+        ESP_LOGE(TAG, "register remote handlers failed");
+        return;
+    }
+    s_stream_running.store(true);
+    s_stream_active.store(true);
+    // 栈要够 frame2jpg 编码用：4K 偏紧，编码偶发栈溢出会直接把设备打重启
+    if (xTaskCreate(stream_task, "ws_camera", 8192, nullptr, 3, nullptr) != pdPASS) {
+        s_stream_active.store(false);
+        s_stream_running.store(false);
+        httpd_stop(s_server);
+        s_server = nullptr;
+        ESP_LOGE(TAG, "create camera task failed");
+        return;
+    }
+    ESP_LOGI(TAG, "WebSocket remote ready on port 80 /ws");
 }
 
 // ---------------------------------------------------------------------------
@@ -292,6 +370,10 @@ bool WifiRemoteControl::Start(std::function<void(const std::string&)> send_cmd,
 }
 
 void WifiRemoteControl::Stop() {
+    s_stream_running.store(false);
+    while (s_stream_active.load() || s_frame_pending.load()) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
     if (s_server != nullptr) {
         httpd_stop(s_server);
         s_server = nullptr;
