@@ -280,10 +280,15 @@ public:
         GetBacklight()->RestoreBrightness();
 
         // 手机网页遥控：开热点 + HTTP 服务器，摇杆指令通过串口发给底盘
-        // 若影响语音功能，注释掉下面这行即可关闭
-        WifiRemoteControl::Start([this](const std::string& cmd) {
-            SendUartMessage(cmd.c_str());
-        });
+        // 第二个回调提供摄像头取帧，网页上方可显示实时画面
+        // 若影响语音功能，注释掉下面这段即可关闭
+        WifiRemoteControl::Start(
+            [this](const std::string& cmd) {
+                SendUartMessage(cmd.c_str());
+            },
+            [this](size_t* len) -> uint8_t* {
+                return camera_ != nullptr ? camera_->SnapshotJpeg(len, 70) : nullptr;
+            });
     }
 
     virtual AudioCodec* GetAudioCodec() override {

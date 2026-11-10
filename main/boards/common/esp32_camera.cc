@@ -336,3 +336,23 @@ std::string Esp32Camera::IdentifyPerson(const std::string& question) {
     }
     return PostImage(face_url_, question);
 }
+
+uint8_t* Esp32Camera::SnapshotJpeg(size_t* out_len, int quality) {
+    if (out_len == nullptr) {
+        return nullptr;
+    }
+    // 直接从驱动队列取一帧，避免和编码线程争用 fb_
+    camera_fb_t* fb = esp_camera_fb_get();
+    if (fb == nullptr) {
+        return nullptr;
+    }
+    uint8_t* jpg = nullptr;
+    size_t jpg_len = 0;
+    bool ok = frame2jpg(fb, static_cast<uint8_t>(quality), &jpg, &jpg_len);
+    esp_camera_fb_return(fb);
+    if (!ok || jpg == nullptr) {
+        return nullptr;
+    }
+    *out_len = jpg_len;
+    return jpg;
+}

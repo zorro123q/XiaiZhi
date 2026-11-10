@@ -1,6 +1,7 @@
 #include "wifi_remote_control.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include <esp_log.h>
@@ -15,6 +16,7 @@ static const char* TAG = "wifi_remote";
 
 static httpd_handle_t s_server = nullptr;
 static std::function<void(const std::string&)> s_send;
+static WifiRemoteControl::CaptureJpegFn s_capture_jpeg;
 
 // ---------------------------------------------------------------------------
 // 手机遥控页面（全屏摇杆，适配触屏）
@@ -25,32 +27,38 @@ static const char kHtml[] = R"HTML(<!doctype html>
 <title>SparkBot 遥控</title>
 <style>
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
-body{margin:0;height:100vh;background:#0d1117;color:#e6edf3;
+body{margin:0;min-height:100vh;background:#0d1117;color:#e6edf3;
      font-family:system-ui,-apple-system,sans-serif;overflow:hidden;
      display:flex;flex-direction:column;align-items:center;justify-content:center;
-     touch-action:none;user-select:none}
-h1{font-size:15px;font-weight:500;color:#8b949e;margin:0 0 20px;letter-spacing:2px}
-#pad{position:relative;width:250px;height:250px;border-radius:50%;
+     gap:10px;padding:10px;touch-action:none;user-select:none}
+h1{font-size:14px;font-weight:500;color:#8b949e;margin:0;letter-spacing:2px}
+#view{width:min(76vw,240px);aspect-ratio:1/1;background:#000;border-radius:12px;
+      overflow:hidden;border:1px solid #30363d}
+#view img{width:100%;height:100%;object-fit:cover;display:block}
+#pad{position:relative;width:min(58vw,180px);aspect-ratio:1/1;border-radius:50%;
      background:radial-gradient(circle at 50% 40%,#161b22,#0d1117 70%);
      border:1.5px solid #30363d;touch-action:none}
-#knob{position:absolute;left:50%;top:50%;width:92px;height:92px;margin:-46px 0 0 -46px;
+#knob{position:absolute;left:50%;top:50%;width:70px;height:70px;margin:-35px 0 0 -35px;
       border-radius:50%;background:linear-gradient(145deg,#1f6feb,#0b3d91);
-      border:1.5px solid #58a6ff;box-shadow:0 0 24px rgba(56,139,253,.5);
+      border:1.5px solid #58a6ff;box-shadow:0 0 20px rgba(56,139,253,.5);
       transition:transform .04s linear}
-#val{margin-top:18px;font-size:13px;color:#8b949e;font-variant-numeric:tabular-nums}
-#hint{margin-top:8px;font-size:11px;color:#484f58}
+#val{font-size:12px;color:#8b949e;font-variant-numeric:tabular-nums}
+#hint{font-size:11px;color:#484f58}
 </style></head><body>
 <h1>SPARKBOT 遥控</h1>
+<div id="view"><img src="/stream" alt="camera"></div>
 <div id="pad"><div id="knob"></div></div>
 <div id="val">x 0.00 &nbsp; y 0.00</div>
-<div id="hint">按住摇杆拖动 · 松手停止</div>
+<div id="hint">拖动摇杆控制 · 松手停止</div>
 <script>
 var pad=document.getElementById('pad'),knob=document.getElementById('knob'),
-    val=document.getElementById('val'),R=100,dragging=false,last=0;
+    val=document.getElementById('val'),dragging=false,last=0;
+function stickR(){return pad.clientWidth/2-8;}
 function send(x,y){fetch('/ctrl?x='+x.toFixed(2)+'&y='+y.toFixed(2)).catch(function(){});}
 function sendStop(){fetch('/stop').catch(function(){});}
 function handle(cx,cy){
   var r=pad.getBoundingClientRect();
+  var R=stickR();
   var dx=cx-(r.left+r.width/2),dy=cy-(r.top+r.height/2);
   var d=Math.sqrt(dx*dx+dy*dy);
   if(d>R){dx=dx/d*R;dy=dy/d*R;}
@@ -102,6 +110,46 @@ static esp_err_t stop_handler(httpd_req_t* req) {
     return ESP_OK;
 }
 
+// MJPEG 视频流：浏览器用 <img src="/stream"> 直接显示
+static esp_err_t stream_handler(httpd_req_t* req) {
+    if (!s_capture_jpeg) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "camera not available");
+        return ESP_OK;
+    }
+    httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+
+    while (true) {
+        size_t len = 0;
+        uint8_t* jpg = s_capture_jpeg(&len);
+        if (jpg == nullptr || len == 0) {
+            if (jpg != nullptr) {
+                free(jpg);
+            }
+            vTaskDelay(pdMS_TO_TICKS(200));
+            continue;
+        }
+
+        char head[96];
+        int head_len = snprintf(head, sizeof(head),
+                                "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %u\r\n\r\n",
+                                static_cast<unsigned>(len));
+        esp_err_t err = httpd_resp_send_chunk(req, head, head_len);
+        if (err == ESP_OK) {
+            err = httpd_resp_send_chunk(req, reinterpret_cast<const char*>(jpg), len);
+        }
+        free(jpg);
+        if (err == ESP_OK) {
+            err = httpd_resp_send_chunk(req, "\r\n", 2);
+        }
+        if (err != ESP_OK) {
+            break;  // 手机端已断开
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));  // 约 10fps
+    }
+    return ESP_OK;
+}
+
 static void start_httpd() {
     if (s_server != nullptr) {
         return;
@@ -137,6 +185,13 @@ static void start_httpd() {
     u_stop.handler = stop_handler;
     u_stop.user_ctx = nullptr;
     httpd_register_uri_handler(s_server, &u_stop);
+
+    httpd_uri_t u_stream = {};
+    u_stream.uri = "/stream";
+    u_stream.method = HTTP_GET;
+    u_stream.handler = stream_handler;
+    u_stream.user_ctx = nullptr;
+    httpd_register_uri_handler(s_server, &u_stream);
 
     ESP_LOGI(TAG, "httpd started on port 80");
 }
@@ -198,8 +253,10 @@ static void ap_task(void* arg) {
     vTaskDelete(nullptr);
 }
 
-bool WifiRemoteControl::Start(std::function<void(const std::string&)> send_cmd) {
+bool WifiRemoteControl::Start(std::function<void(const std::string&)> send_cmd,
+                              CaptureJpegFn capture_jpeg) {
     s_send = std::move(send_cmd);
+    s_capture_jpeg = std::move(capture_jpeg);
     BaseType_t ok = xTaskCreate(ap_task, "wifi_remote", 4096, nullptr, 3, nullptr);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "create ap_task failed");

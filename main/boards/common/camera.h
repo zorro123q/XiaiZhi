@@ -1,6 +1,8 @@
 #ifndef CAMERA_H
 #define CAMERA_H
 
+#include <cstddef>
+#include <cstdint>
 #include <string>
 
 class Camera {
@@ -15,6 +17,11 @@ public:
     // 识别人物身份（默认不支持）
     virtual std::string IdentifyPerson(const std::string& question) {
         return "{\"success\": false, \"message\": \"Face recognition not supported\"}";
+    }
+    // 抓一帧并编码为 JPEG，用于网页实时预览。
+    // 返回 malloc 申请的缓冲区，调用方负责 free；失败返回 nullptr。
+    virtual uint8_t* SnapshotJpeg(size_t* out_len, int quality = 70) {
+        return nullptr;
     }
 };
 

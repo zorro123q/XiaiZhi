@@ -40,6 +40,8 @@ public:
     virtual bool SetVFlip(bool enabled) override;
     virtual std::string Explain(const std::string& question);
     virtual std::string IdentifyPerson(const std::string& question) override;
+    // 抓一帧转 JPEG（网页实时预览用），返回 malloc 缓冲区，调用方 free
+    virtual uint8_t* SnapshotJpeg(size_t* out_len, int quality = 70) override;
 };
 
 #endif // ESP32_CAMERA_H
