@@ -44,9 +44,18 @@ h1{font-size:14px;font-weight:500;color:#8b949e;margin:0;letter-spacing:2px}
       transition:transform .04s linear}
 #val{font-size:12px;color:#8b949e;font-variant-numeric:tabular-nums}
 #hint{font-size:11px;color:#484f58}
+#flips{display:flex;gap:8px}
+#flips button{background:#21262d;color:#8b949e;border:1px solid #30363d;
+              border-radius:6px;padding:5px 10px;font-size:11px;
+              -webkit-tap-highlight-color:transparent}
+#flips button.on{color:#58a6ff;border-color:#1f6feb}
 </style></head><body>
 <h1>SPARKBOT 遥控</h1>
-<div id="view"><img src="/stream" alt="camera"></div>
+<div id="view"><img id="cam" src="/stream" alt="camera"></div>
+<div id="flips">
+  <button id="fh" onclick="toggleH()">左右翻转</button>
+  <button id="fv" onclick="toggleV()">上下翻转</button>
+</div>
 <div id="pad"><div id="knob"></div></div>
 <div id="val">x 0.00 &nbsp; y 0.00</div>
 <div id="hint">拖动摇杆控制 · 松手停止</div>
@@ -54,6 +63,15 @@ h1{font-size:14px;font-weight:500;color:#8b949e;margin:0;letter-spacing:2px}
 var pad=document.getElementById('pad'),knob=document.getElementById('knob'),
     val=document.getElementById('val'),dragging=false,last=0;
 function stickR(){return pad.clientWidth/2-8;}
+var cam=document.getElementById('cam'),fhOn=true,fvOn=false;
+function applyFlip(){
+  cam.style.transform='scaleX('+(fhOn?-1:1)+') scaleY('+(fvOn?-1:1)+')';
+  document.getElementById('fh').className=fhOn?'on':'';
+  document.getElementById('fv').className=fvOn?'on':'';
+}
+function toggleH(){fhOn=!fhOn;applyFlip();}
+function toggleV(){fvOn=!fvOn;applyFlip();}
+applyFlip();
 function send(x,y){fetch('/ctrl?x='+x.toFixed(2)+'&y='+y.toFixed(2)).catch(function(){});}
 function sendStop(){fetch('/stop').catch(function(){});}
 function handle(cx,cy){
@@ -66,7 +84,7 @@ function handle(cx,cy){
   var x=dx/R,y=-dy/R;
   val.textContent='x '+x.toFixed(2)+'   y '+y.toFixed(2);
   var now=performance.now();
-  if(now-last>100){last=now;send(x,y);}
+  if(now-last>150){last=now;send(x,y);}
 }
 pad.addEventListener('pointerdown',function(e){dragging=true;
   if(pad.setPointerCapture)pad.setPointerCapture(e.pointerId);
@@ -92,8 +110,9 @@ static esp_err_t ctrl_handler(httpd_req_t* req) {
     if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
         httpd_query_key_value(query, "x", xbuf, sizeof(xbuf)) == ESP_OK &&
         httpd_query_key_value(query, "y", ybuf, sizeof(ybuf)) == ESP_OK) {
-        char cmd[40];
-        snprintf(cmd, sizeof(cmd), "x%s y%s", xbuf, ybuf);
+        char cmd[48];
+        // 末尾加 \n：底盘按行区分指令，否则连续发送会粘包，sscanf 只解析第一条
+        snprintf(cmd, sizeof(cmd), "x%s y%s\n", xbuf, ybuf);
         if (s_send) {
             s_send(cmd);
         }
@@ -145,7 +164,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
         if (err != ESP_OK) {
             break;  // 手机端已断开
         }
-        vTaskDelay(pdMS_TO_TICKS(100));  // 约 10fps
+        vTaskDelay(pdMS_TO_TICKS(150));  // 约 6-7fps，降低 CPU 与摄像头压力
     }
     return ESP_OK;
 }
