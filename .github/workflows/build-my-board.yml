@@ -1,7 +1,7 @@
 name: Build My Board
 
 # 手动触发：Actions 页面点 Run workflow，填板子名
-# 推送触发：只针对 sparkbot-ws-remote 分支，用来验证遥控改动是否真能编过
+# 推送触发：main 有更新就自动编一次 esp-sparkbot（公开仓库 Actions 免费）
 on:
   workflow_dispatch:
     inputs:
@@ -11,7 +11,7 @@ on:
         default: 'esp-sparkbot'
   push:
     branches:
-      - sparkbot-ws-remote
+      - main
 
 jobs:
   build:
