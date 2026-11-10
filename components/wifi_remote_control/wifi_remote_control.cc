@@ -145,12 +145,35 @@ static void start_httpd() {
 // 开热点（延迟启动，避免和 STA 抢信道）
 // ---------------------------------------------------------------------------
 static void ap_task(void* arg) {
-    vTaskDelay(pdMS_TO_TICKS(4000));  // 等原有 WiFi 连上
+    vTaskDelay(pdMS_TO_TICKS(6000));  // 等 WiFi 状态稳定
 
-    esp_netif_create_default_wifi_ap();
+    // 1) 只在 STA 已连接时启用。设备处于配网模式时，WifiConfigurationAp 已经创建了
+    //    WIFI_AP_DEF 和 80 端口服务器，这里再创建会触发 assert（duplicate key）→ 重启。
+    wifi_ap_record_t sta_info;
+    if (esp_wifi_sta_get_ap_info(&sta_info) != ESP_OK) {
+        ESP_LOGW(TAG, "STA 未连接（可能处于配网模式），跳过遥控热点");
+        vTaskDelete(nullptr);
+        return;
+    }
 
+    // 2) 复用已有 AP netif，不要重复创建
+    esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+    if (ap_netif == nullptr) {
+        ap_netif = esp_netif_create_default_wifi_ap();
+    }
+    if (ap_netif == nullptr) {
+        ESP_LOGE(TAG, "无法获取 AP netif，放弃遥控热点");
+        vTaskDelete(nullptr);
+        return;
+    }
+
+    // 3) 切 APSTA，保留原有的 STA 连接
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
-    ESP_LOGI(TAG, "set WIFI_MODE_APSTA: %s", esp_err_to_name(err));
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set WIFI_MODE_APSTA failed: %s", esp_err_to_name(err));
+        vTaskDelete(nullptr);
+        return;
+    }
 
     wifi_config_t ap_cfg = {};
     const char* ssid = "SparkBot-Car";
@@ -163,10 +186,14 @@ static void ap_task(void* arg) {
     ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
-    ESP_LOGI(TAG, "set AP config: %s (ssid=%s pass=%s)", esp_err_to_name(err), ssid, pass);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "set AP config failed: %s", esp_err_to_name(err));
+        vTaskDelete(nullptr);
+        return;
+    }
+    ESP_LOGI(TAG, "AP configured: ssid=%s pass=%s", ssid, pass);
 
     start_httpd();
-
     ESP_LOGI(TAG, "phone -> wifi '%s' / '%s' -> http://192.168.4.1", ssid, pass);
     vTaskDelete(nullptr);
 }
