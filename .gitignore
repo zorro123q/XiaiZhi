@@ -22,6 +22,9 @@ mmap_generate_*.h
 # 本地工作日志（不要公开）
 .workbuddy/
 
+# 仓库损坏时的临时备份（不要提交）
+.git_broken_*/
+
 # 人脸生物特征数据（不要公开）
 face_service/photos/
 face_service/face_db.json
