@@ -1,5 +1,6 @@
 tmp/
-components/
+components/*
+!components/wifi_remote_control/
 managed_components/
 build/
 .vscode/
