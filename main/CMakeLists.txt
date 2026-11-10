@@ -307,6 +307,7 @@ endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
+                    REQUIRES esp_http_server esp_wifi
                     WHOLE_ARCHIVE
                     )
 

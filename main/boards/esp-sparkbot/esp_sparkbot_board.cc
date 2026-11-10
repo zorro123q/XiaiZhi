@@ -16,6 +16,7 @@
 #include <cstring>
 
 #include "esp32_camera.h"
+#include "wifi_remote_control.h"
 
 #define TAG "esp_sparkbot"
 
@@ -277,6 +278,12 @@ public:
         InitializeEchoUart();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
+
+        // 手机网页遥控：开热点 + HTTP 服务器，摇杆指令通过串口发给底盘
+        // 若影响语音功能，注释掉下面这行即可关闭
+        WifiRemoteControl::Start([this](const std::string& cmd) {
+            SendUartMessage(cmd.c_str());
+        });
     }
 
     virtual AudioCodec* GetAudioCodec() override {
