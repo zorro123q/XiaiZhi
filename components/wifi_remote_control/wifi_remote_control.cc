@@ -138,6 +138,7 @@ static esp_err_t stream_handler(httpd_req_t* req) {
     httpd_resp_set_type(req, "multipart/x-mixed-replace; boundary=frame");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
 
+    int consecutive_fail = 0;
     while (true) {
         size_t len = 0;
         uint8_t* jpg = s_capture_jpeg(&len);
@@ -145,9 +146,15 @@ static esp_err_t stream_handler(httpd_req_t* req) {
             if (jpg != nullptr) {
                 free(jpg);
             }
+            // 连续取不到帧就退出，否则永久占用 socket，导致 /ctrl 被拒
+            if (++consecutive_fail > 30) {
+                ESP_LOGW(TAG, "stream: no frame for ~6s, closing connection");
+                break;
+            }
             vTaskDelay(pdMS_TO_TICKS(200));
             continue;
         }
+        consecutive_fail = 0;
 
         char head[96];
         int head_len = snprintf(head, sizeof(head),
@@ -175,7 +182,7 @@ static void start_httpd() {
     }
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = 80;
-    cfg.max_open_sockets = 4;
+    cfg.max_open_sockets = 7;  // 留足余量：/stream 长连接会常驻占一个
     cfg.lru_purge_enable = true;
 
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
