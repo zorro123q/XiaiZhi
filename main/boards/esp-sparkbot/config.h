@@ -3,6 +3,7 @@
 
 #include <driver/gpio.h>
 #include <driver/uart.h>
+#include <hal/adc_types.h>
 
 #define AUDIO_INPUT_SAMPLE_RATE  16000
 #define AUDIO_OUTPUT_SAMPLE_RATE 16000
@@ -54,6 +55,18 @@
 #define ECHO_UART_PORT_NUM      UART_NUM_1
 #define ECHO_UART_BAUD_RATE     (115200)
 #define BUF_SIZE                (1024)
+
+/*
+   电池电压检测
+   主体 PCB 上电池电压经 100k/100k 分压后送入 ADC2_CH3(GPIO14)，
+   参数与官方出厂 demo（example/factory_demo_v1/main/app/app_power.c）一致。
+*/
+#define BATTERY_ADC_UNIT        ADC_UNIT_2
+#define BATTERY_ADC_CHANNEL     ADC_CHANNEL_3   // ESP32-S3: ADC2_CH3 = GPIO14
+#define BATTERY_UPPER_RESISTOR  100000.0f       // 分压上电阻 100k
+#define BATTERY_LOWER_RESISTOR  100000.0f       // 分压下电阻 100k
+// 充电检测引脚：主体没有引出充电状态脚，先留空，充电状态由电压趋势软件判断
+#define BATTERY_CHARGING_PIN    GPIO_NUM_NC
 
 typedef enum {
     LIGHT_MODE_CHARGING_BREATH = 0,

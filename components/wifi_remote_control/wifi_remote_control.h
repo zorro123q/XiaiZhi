@@ -20,13 +20,17 @@ class WifiRemoteControl {
 public:
     // 抓一帧并转成 JPEG，返回 malloc 缓冲区（调用方 free），失败返回 nullptr
     using CaptureJpegFn = std::function<uint8_t*(size_t*)>;
+    // 读电池电量与充电状态，返回 false 表示当前读不到
+    using BatteryFn = std::function<bool(int&, bool&)>;
 
     /**
      * @param send_cmd      收到摇杆位置后如何下发指令，例如 "x0.5 y1.0"
      * @param capture_jpeg  可选：摄像头取帧回调，提供后网页可显示实时画面
+     * @param read_battery  可选：电池读取回调，提供后网页顶部显示电量
      */
     static bool Start(std::function<void(const std::string&)> send_cmd,
-                      CaptureJpegFn capture_jpeg = nullptr);
+                      CaptureJpegFn capture_jpeg = nullptr,
+                      BatteryFn read_battery = nullptr);
 
     static void Stop();
 };

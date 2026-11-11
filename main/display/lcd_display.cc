@@ -421,6 +421,15 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_color(battery_label_, current_theme_.text, 0);
     lv_obj_set_style_margin_left(battery_label_, 5, 0); // 添加左边距，与前面的元素分隔
 
+#if defined(CONFIG_BOARD_TYPE_ESP_SPARKBOT)
+    // 该板子有电池检测，图标右边再显示百分比数字
+    battery_pct_label_ = lv_label_create(status_bar_);
+    lv_label_set_text(battery_pct_label_, "");
+    lv_obj_set_style_text_font(battery_pct_label_, fonts_.text_font, 0);
+    lv_obj_set_style_text_color(battery_pct_label_, current_theme_.text, 0);
+    lv_obj_set_style_margin_left(battery_pct_label_, 3, 0);
+#endif
+
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, fonts_.text_font->line_height * 2);
@@ -814,6 +823,15 @@ void LcdDisplay::SetupUI() {
     lv_obj_set_style_text_font(battery_label_, fonts_.icon_font, 0);
     lv_obj_set_style_text_color(battery_label_, current_theme_.text, 0);
 
+#if defined(CONFIG_BOARD_TYPE_ESP_SPARKBOT)
+    // 该板子有电池检测，图标右边再显示百分比数字
+    battery_pct_label_ = lv_label_create(status_bar_);
+    lv_label_set_text(battery_pct_label_, "");
+    lv_obj_set_style_text_font(battery_pct_label_, fonts_.text_font, 0);
+    lv_obj_set_style_text_color(battery_pct_label_, current_theme_.text, 0);
+    lv_obj_set_style_margin_left(battery_pct_label_, 3, 0);
+#endif
+
     low_battery_popup_ = lv_obj_create(screen);
     lv_obj_set_scrollbar_mode(low_battery_popup_, LV_SCROLLBAR_MODE_OFF);
     lv_obj_set_size(low_battery_popup_, LV_HOR_RES * 0.9, fonts_.text_font->line_height * 2);
@@ -982,6 +1000,9 @@ void LcdDisplay::SetTheme(const std::string& theme_name) {
         }
         if (battery_label_ != nullptr) {
             lv_obj_set_style_text_color(battery_label_, current_theme_.text, 0);
+        }
+        if (battery_pct_label_ != nullptr) {
+            lv_obj_set_style_text_color(battery_pct_label_, current_theme_.text, 0);
         }
         if (emotion_label_ != nullptr) {
             lv_obj_set_style_text_color(emotion_label_, current_theme_.text, 0);

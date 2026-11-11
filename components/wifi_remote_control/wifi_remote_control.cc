@@ -35,6 +35,8 @@ struct VideoFrame {
 };
 static std::function<void(const std::string&)> s_send;
 static WifiRemoteControl::CaptureJpegFn s_capture_jpeg;
+static WifiRemoteControl::BatteryFn s_read_battery;
+static int64_t s_last_battery_send = 0;
 
 // ---------------------------------------------------------------------------
 // 手机遥控页面（全屏摇杆，适配触屏）
@@ -67,8 +69,11 @@ h1{font-size:14px;font-weight:500;color:#8b949e;margin:0;letter-spacing:2px}
               border-radius:6px;padding:5px 10px;font-size:11px;
               -webkit-tap-highlight-color:transparent}
 #flips button.on{color:#58a6ff;border-color:#1f6feb}
+#bat{font-size:12px;color:#3fb950;letter-spacing:0;margin-left:6px}
+#bat.low{color:#f85149}
+#bat.hide{display:none}
 </style></head><body>
-<h1>SPARKBOT 遥控</h1>
+<h1>SPARKBOT 遥控 <span id="bat" class="hide"></span></h1>
 <div id="view"><img id="cam" alt="camera"></div>
 <div id="flips">
   <button id="fh" onclick="toggleH()">左右翻转</button>
@@ -82,7 +87,7 @@ var pad=document.getElementById('pad'),knob=document.getElementById('knob'),
     val=document.getElementById('val'),hint=document.getElementById('hint'),
     dragging=false,last=0,currentX=0,currentY=0,pointerId=null;
 function stickR(){return pad.clientWidth/2-8;}
-var cam=document.getElementById('cam'),fhOn=true,fvOn=false;
+var cam=document.getElementById('cam'),fhOn=true,fvOn=false,bat=document.getElementById('bat');
 function applyFlip(){
   cam.style.transform='scaleX('+(fhOn?-1:1)+') scaleY('+(fvOn?-1:1)+')';
   document.getElementById('fh').className=fhOn?'on':'';
@@ -109,7 +114,17 @@ function connect(){
   ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws');
   ws.onopen=function(){resetStick();sendStop();hint.textContent='已连接 · 拖动摇杆控制 · 松手停止';};
   ws.onmessage=function(event){
-    if(typeof event.data==='string'||imageBusy)return;
+    if(typeof event.data==='string'){
+      try{
+        var msg=JSON.parse(event.data);
+        if(typeof msg.level==='number'){
+          bat.textContent=msg.charging?(msg.level+'% 充电中'):(msg.level+'%');
+          bat.className=msg.level<20?'low':'';
+        }
+      }catch(e){}
+      return;
+    }
+    if(imageBusy)return;
     var previous=imageUrl;
     imageUrl=URL.createObjectURL(new Blob([event.data],{type:'image/jpeg'}));
     imageBusy=true;cam.src=imageUrl;
@@ -175,6 +190,24 @@ static void close_client(httpd_handle_t server, int fd) {
     close(fd);
 }
 
+// 复用控制用的 WebSocket 下发一条文本帧：{"level":78,"charging":false}
+// 走同一条连接，不额外占用 socket
+static void send_battery_frame(void*) {
+    if (s_server == nullptr || s_client_fd < 0 || !s_read_battery) return;
+    int level = 0;
+    bool charging = false;
+    if (!s_read_battery(level, charging)) return;
+    char text[64];
+    int len = snprintf(text, sizeof(text), "{\"level\":%d,\"charging\":%s}",
+                       level, charging ? "true" : "false");
+    if (len <= 0) return;
+    httpd_ws_frame_t packet = {};
+    packet.type = HTTPD_WS_TYPE_TEXT;
+    packet.payload = reinterpret_cast<uint8_t*>(text);
+    packet.len = len;
+    httpd_ws_send_frame_async(s_server, s_client_fd, &packet);
+}
+
 static esp_err_t ws_handler(httpd_req_t* req) {
     int fd = httpd_req_to_sockfd(req);
     if (req->method == HTTP_GET) {
@@ -198,6 +231,11 @@ static esp_err_t ws_handler(httpd_req_t* req) {
     if (err != ESP_OK) return err;
     if (strcmp(text, "PING") == 0) {
         s_last_seen = esp_timer_get_time();
+        // 借心跳顺带下发电量，10 秒一次
+        if (s_read_battery && esp_timer_get_time() - s_last_battery_send > 10000000) {
+            s_last_battery_send = esp_timer_get_time();
+            httpd_queue_work(s_server, send_battery_frame, nullptr);
+        }
         return ESP_OK;
     }
     float x = 0, y = 0;
@@ -358,9 +396,11 @@ static void ap_task(void* arg) {
 }
 
 bool WifiRemoteControl::Start(std::function<void(const std::string&)> send_cmd,
-                              CaptureJpegFn capture_jpeg) {
+                              CaptureJpegFn capture_jpeg,
+                              BatteryFn read_battery) {
     s_send = std::move(send_cmd);
     s_capture_jpeg = std::move(capture_jpeg);
+    s_read_battery = std::move(read_battery);
     BaseType_t ok = xTaskCreate(ap_task, "wifi_remote", 4096, nullptr, 3, nullptr);
     if (ok != pdPASS) {
         ESP_LOGE(TAG, "create ap_task failed");

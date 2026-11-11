@@ -1,6 +1,7 @@
 #include <esp_log.h>
 #include <esp_err.h>
 #include <string>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <font_awesome.h>
@@ -51,6 +52,9 @@ Display::~Display() {
         lv_obj_del(status_label_);
         lv_obj_del(mute_label_);
         lv_obj_del(battery_label_);
+        if (battery_pct_label_ != nullptr) {
+            lv_obj_del(battery_pct_label_);
+        }
         lv_obj_del(emotion_label_);
     }
     if( low_battery_popup_ != nullptr ) {
@@ -152,6 +156,12 @@ void Display::UpdateStatusBar(bool update_all) {
         if (battery_label_ != nullptr && battery_icon_ != icon) {
             battery_icon_ = icon;
             lv_label_set_text(battery_label_, battery_icon_);
+        }
+        // 部分板子（如 ESP-SparkBot）在图标后额外显示百分比数字
+        if (battery_pct_label_ != nullptr) {
+            char pct[8];
+            snprintf(pct, sizeof(pct), "%d%%", battery_level);
+            lv_label_set_text(battery_pct_label_, pct);
         }
 
         if (low_battery_popup_ != nullptr) {

@@ -17,6 +17,7 @@
 
 #include "esp32_camera.h"
 #include "wifi_remote_control.h"
+#include "sparkbot_battery.h"
 
 #define TAG "esp_sparkbot"
 
@@ -51,6 +52,7 @@ private:
     Button boot_button_;
     Display* display_;
     Esp32Camera* camera_;
+    SparkBotBattery* battery_ = nullptr;
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
 
     void InitializeI2c() {
@@ -173,6 +175,18 @@ private:
         camera_->SetVFlip(camera_flipped);
     }
 
+    // 电池电量检测：主体 PCB 的电池分压接在 ADC2_CH3(GPIO14)
+    void InitializeBattery() {
+        battery_ = new SparkBotBattery(BATTERY_ADC_UNIT, BATTERY_ADC_CHANNEL,
+                                       BATTERY_UPPER_RESISTOR, BATTERY_LOWER_RESISTOR,
+                                       BATTERY_CHARGING_PIN);
+        if (!battery_->Initialize()) {
+            delete battery_;
+            battery_ = nullptr;
+            ESP_LOGW(TAG, "电池检测不可用，状态栏不显示电量");
+        }
+    }
+
     /*
         ESP-SparkBot 的底座
         https://gitee.com/esp-friends/esp_sparkbot/tree/master/example/tank/c2_tracked_chassis
@@ -266,6 +280,18 @@ private:
             
             return true;
         });
+
+        mcp_server.AddTool("self.battery.get_level", "获取设备电池电量（百分比）以及是否正在充电", PropertyList(),
+            [this](const PropertyList& properties) -> ReturnValue {
+                int level = 0;
+                bool charging = false;
+                bool discharging = false;
+                if (!GetBatteryLevel(level, charging, discharging)) {
+                    return std::string("无法读取电池电量，电池检测不可用");
+                }
+                return std::string("{\"level\":") + std::to_string(level) +
+                       ",\"charging\":" + (charging ? "true" : "false") + "}";
+            });
     }
 
 public:
@@ -275,12 +301,14 @@ public:
         InitializeDisplay();
         InitializeButtons();
         InitializeCamera();
+        InitializeBattery();
         InitializeEchoUart();
         InitializeTools();
         GetBacklight()->RestoreBrightness();
 
         // 手机网页遥控：开热点 + HTTP 服务器，摇杆指令通过串口发给底盘
         // 第二个回调提供摄像头取帧，网页上方可显示实时画面
+        // 第三个回调提供电量，网页顶部显示百分比
         // 若影响语音功能，注释掉下面这段即可关闭
         WifiRemoteControl::Start(
             [this](const std::string& cmd) {
@@ -288,6 +316,10 @@ public:
             },
             [this](size_t* len) -> uint8_t* {
                 return camera_ != nullptr ? camera_->SnapshotJpeg(len, 70) : nullptr;
+            },
+            [this](int& level, bool& charging) -> bool {
+                bool discharging = false;
+                return GetBatteryLevel(level, charging, discharging);
             });
     }
 
@@ -309,6 +341,17 @@ public:
 
     virtual Camera* GetCamera() override {
         return camera_;
+    }
+
+    // 供状态栏电量图标、设备状态上报（self.get_device_status）和 MCP 工具使用
+    virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override {
+        if (battery_ == nullptr || !battery_->IsValid()) {
+            return false;
+        }
+        level = battery_->GetLevel();
+        charging = battery_->IsCharging();
+        discharging = !charging;
+        return true;
     }
 };
 
