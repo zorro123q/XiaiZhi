@@ -77,9 +77,14 @@ private:
     // 跳舞灯光联动：底盘是单向串口（只发不收），跳舞何时结束拿不到回执，
     // 只能按约定时长开一次性定时器，到点由 OnDanceLightTimeout 把灯切回休眠。
     // 期间若用户手动切换灯光，会取消定时器，避免把用户选的模式又覆盖回休眠。
-    esp_timer_handle_t dance_light_timer_ = nullptr;
+    //
+    // w7 必须与 d1 错开发送：底盘协议无分隔符、按字符流解析，两条命令同毫秒
+    // 发出会在总线上连成 "d1w7"，底盘只会执行第一条，w7 被静默丢弃。
+    esp_timer_handle_t dance_show_timer_ = nullptr;   // d1 → w7 的错峰延时
+    esp_timer_handle_t dance_light_timer_ = nullptr;  // 舞蹈结束 → w8
     bool dance_light_pending_ = false;
     static constexpr int kDanceLightDefaultSec = 12;
+    static constexpr int kDanceShowGapMs = 150;       // 错峰时长，够底盘吃完 d1
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -246,6 +251,18 @@ private:
         };
         ESP_ERROR_CHECK(esp_timer_create(&dance_timer_args, &dance_light_timer_));
 
+        // d1 → w7 的错峰定时器，避免两条命令在串口上粘成一条
+        esp_timer_create_args_t show_timer_args = {
+            .callback = [](void* arg) {
+                static_cast<EspSparkBot*>(arg)->OnDanceShowTick();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "dance_show",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&show_timer_args, &dance_show_timer_));
+
         // 巡航速度从 NVS 恢复（set_speed 工具会写进去）
         Settings settings("sparkbot", false);
         int stored_speed = settings.GetInt("cruise-speed", 100);
@@ -262,25 +279,37 @@ private:
         ESP_LOGI(TAG, "Sent command: %s", command_str);
     }
 
-    // 跳舞开始：点亮灯光秀(w7)，并预定 duration_sec 秒后切休眠(w8)
+    // 跳舞开始：错峰点亮灯光秀(w7)，并预定 duration_sec 秒后切休眠(w8)
     void StartDanceLight(int duration_sec) {
-        SendUartMessage("w7");
         light_mode_ = LIGHT_MODE_SHOW;
-        if (dance_light_timer_ == nullptr) {
+        if (dance_light_timer_ == nullptr || dance_show_timer_ == nullptr) {
             ESP_LOGW(TAG, "跳舞灯光定时器未就绪，本次不做联动");
             return;
         }
+        // 先排好 w7 的错峰发送，再排 w8 的收尾
+        esp_timer_stop(dance_show_timer_);
+        esp_timer_start_once(dance_show_timer_, static_cast<uint64_t>(kDanceShowGapMs) * 1000ULL);
+
         esp_timer_stop(dance_light_timer_);
         esp_timer_start_once(dance_light_timer_,
                              static_cast<uint64_t>(duration_sec) * 1000000ULL);
         dance_light_pending_ = true;
-        ESP_LOGI(TAG, "跳舞灯光：切到灯秀，%d 秒后切休眠", duration_sec);
+        ESP_LOGI(TAG, "跳舞灯光：%dms 后切灯秀，%d 秒后切休眠", kDanceShowGapMs, duration_sec);
+    }
+
+    // 错峰到点，此时 d1 已被底盘读走，w7 单独成帧
+    void OnDanceShowTick() {
+        SendUartMessage("w7");
     }
 
     // 用户手动切灯时调用：取消"到点切回休眠"，别把用户的选覆盖掉
     void CancelDanceLight() {
         if (dance_light_timer_ == nullptr) {
             return;
+        }
+        // w7 还没发出去也一并取消，否则会在用户切灯后把灯抢回灯秀
+        if (dance_show_timer_ != nullptr) {
+            esp_timer_stop(dance_show_timer_);
         }
         // 用返回值判断是否真的取消了（未运行/已触发完成时返回错误码，幂等）
         if (esp_timer_stop(dance_light_timer_) == ESP_OK) {
