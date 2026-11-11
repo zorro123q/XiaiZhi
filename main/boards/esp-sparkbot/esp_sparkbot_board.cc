@@ -13,6 +13,10 @@
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
 #include <driver/uart.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <freertos/semphr.h>
+#include <cstdio>
 #include <cstring>
 
 #include "esp32_camera.h"
@@ -54,6 +58,20 @@ private:
     Esp32Camera* camera_;
     SparkBotBattery* battery_ = nullptr;
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
+
+    // 底盘运动状态。底盘的串口看门狗约 500ms 收不到指令就自动刹停（见
+    // c2_tracked_chassis/main/tracked_chassis.c 的 uart_read_count > 25），
+    // 所以"走一段距离"必须由头部按固定间隔持续重发，而不是只发一次。
+    SemaphoreHandle_t motion_mutex_ = nullptr;
+    float motion_x_ = 0.0f;
+    float motion_y_ = 0.0f;
+    TickType_t motion_deadline_ = 0;
+    bool motion_running_ = false;
+    bool motion_continuous_ = false;  // true = 一直走，直到 stop 或撞上安全上限
+    int cruise_speed_ = 100;          // 1-100，短动作和"一直走"的默认速度百分比
+    static constexpr int kMotionResendMs = 100;   // 看门狗 500ms，100ms 重发留足余量
+    static constexpr int kMotionStackSize = 3072;
+    static constexpr int kContinuousMaxMs = 60000;  // 无限运动的安全上限：60 秒
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -207,12 +225,182 @@ private:
         ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, UART_ECHO_TXD, UART_ECHO_RXD, UART_ECHO_RTS, UART_ECHO_CTS));
 
         SendUartMessage("w2");
+
+        // 巡航速度从 NVS 恢复（set_speed 工具会写进去）
+        Settings settings("sparkbot", false);
+        int stored_speed = settings.GetInt("cruise-speed", 100);
+        cruise_speed_ = (stored_speed >= 10 && stored_speed <= 100) ? stored_speed : 100;
+
+        // 运动重发任务：负责把"走 N 秒"翻译成持续的 x/y 指令
+        motion_mutex_ = xSemaphoreCreateMutex();
+        xTaskCreate(MotionTaskEntry, "chassis_motion", kMotionStackSize, this, 5, nullptr);
     }
 
     void SendUartMessage(const char * command_str) {
         uint8_t len = strlen(command_str);
         uart_write_bytes(ECHO_UART_PORT_NUM, command_str, len);
         ESP_LOGI(TAG, "Sent command: %s", command_str);
+    }
+
+    // 周期重发的指令不打日志，否则一串口就刷屏
+    void SendUartRaw(const char * command_str) {
+        uart_write_bytes(ECHO_UART_PORT_NUM, command_str, strlen(command_str));
+    }
+
+    // sdkconfig 开了 CONFIG_NEWLIB_NANO_FORMAT，printf 家族不支持 %f，
+    // 所以把 [-1,1] 的系数手工拼成 "0.50" / "-1.00" 这种底盘认识的格式
+    static void FormatCoefficient(float value, char* out, size_t out_size) {
+        bool negative = value < 0.0f;
+        if (negative) {
+            value = -value;
+        }
+        int scaled = static_cast<int>(value * 100.0f + 0.5f);  // 0 ~ 100
+        snprintf(out, out_size, "%s%d.%02d", negative ? "-" : "", scaled / 100, scaled % 100);
+    }
+
+    // duration_ms > 0：走这么久后主动停车；duration_ms <= 0：一直走，直到 stop
+    // （仍然保留 60 秒安全上限，避免模型忘了停车导致小车撞墙）
+    void StartMotion(float x, float y, int duration_ms) {
+        if (motion_mutex_ == nullptr) {
+            return;
+        }
+        if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
+            ESP_LOGW(TAG, "底盘状态忙，忽略本次运动指令");
+            return;
+        }
+        bool continuous = duration_ms <= 0;
+        motion_x_ = x;
+        motion_y_ = y;
+        motion_continuous_ = continuous;
+        motion_deadline_ = xTaskGetTickCount() + pdMS_TO_TICKS(continuous ? kContinuousMaxMs : duration_ms);
+        motion_running_ = true;
+        xSemaphoreGive(motion_mutex_);
+        ESP_LOGI(TAG, "底盘运动 x=%d/100 y=%d/100 %s", static_cast<int>(x * 100),
+                 static_cast<int>(y * 100), continuous ? "持续直到停车" : "定时");
+    }
+
+    // 调速度：存 NVS，正在走的话同步改当前速度（原地转向时不改，免得突然窜出去）
+    void SetCruiseSpeed(int percent) {
+        if (percent < 10) {
+            percent = 10;
+        } else if (percent > 100) {
+            percent = 100;
+        }
+        cruise_speed_ = percent;
+
+        Settings settings("sparkbot", true);
+        settings.SetInt("cruise-speed", percent);
+
+        if (motion_mutex_ == nullptr) {
+            return;
+        }
+        if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
+            return;
+        }
+        if (motion_running_ && (motion_y_ > 0.01f || motion_y_ < -0.01f)) {
+            motion_y_ = (motion_y_ > 0.0f) ? (percent / 100.0f) : (-percent / 100.0f);
+        }
+        xSemaphoreGive(motion_mutex_);
+        ESP_LOGI(TAG, "巡航速度设为 %d%%", percent);
+    }
+
+    std::string GetMotionStatusJson() {
+        bool running = false;
+        bool continuous = false;
+        int turn = 0;
+        int speed = 0;
+        if (motion_mutex_ != nullptr && xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(100)) == pdTRUE) {
+            running = motion_running_;
+            continuous = motion_continuous_;
+            turn = static_cast<int>(motion_x_ * 100);
+            speed = static_cast<int>(motion_y_ * 100);
+            xSemaphoreGive(motion_mutex_);
+        }
+        return std::string("{\"moving\":") + (running ? "true" : "false") +
+               ",\"continuous\":" + (continuous ? "true" : "false") +
+               ",\"turn\":" + std::to_string(turn) +
+               ",\"speed\":" + std::to_string(speed) +
+               ",\"cruise_speed\":" + std::to_string(cruise_speed_) + "}";
+    }
+
+    void StopMotion() {
+        if (motion_mutex_ == nullptr) {
+            return;
+        }
+        if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
+            return;
+        }
+        bool was_running = motion_running_;
+        motion_running_ = false;
+        motion_continuous_ = false;
+        xSemaphoreGive(motion_mutex_);
+        // 手机摇杆每 150ms 都会调一次，只在真的从"在走"变"停"时打日志
+        if (was_running) {
+            ESP_LOGI(TAG, "底盘停止");
+        }
+    }
+
+    static void MotionTaskEntry(void* arg) {
+        static_cast<EspSparkBot*>(arg)->MotionTaskLoop();
+    }
+
+    void MotionTaskLoop() {
+        bool sending = false;
+        float last_x = 0.0f;
+        float last_y = 0.0f;
+
+        while (true) {
+            vTaskDelay(pdMS_TO_TICKS(kMotionResendMs));
+
+            float x = 0.0f;
+            float y = 0.0f;
+            bool should_send = false;
+            bool expired = false;
+            bool hit_safety_cap = false;
+
+            if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(50)) == pdTRUE) {
+                if (motion_running_) {
+                    // 持续运动也受 60 秒安全上限约束，到点一律停车
+                    if (xTaskGetTickCount() < motion_deadline_) {
+                        x = motion_x_;
+                        y = motion_y_;
+                        should_send = true;
+                    } else {
+                        hit_safety_cap = motion_continuous_;
+                        motion_running_ = false;
+                        motion_continuous_ = false;
+                        expired = true;
+                    }
+                }
+                xSemaphoreGive(motion_mutex_);
+            } else if (sending) {
+                // 一时拿不到锁就沿用上一拍，别让底盘看门狗误触发停车
+                x = last_x;
+                y = last_y;
+                should_send = true;
+            }
+
+            if (should_send) {
+                char xs[8];
+                char ys[8];
+                char buf[24];
+                FormatCoefficient(x, xs, sizeof(xs));
+                FormatCoefficient(y, ys, sizeof(ys));
+                snprintf(buf, sizeof(buf), "x%s y%s", xs, ys);
+                SendUartRaw(buf);
+                last_x = x;
+                last_y = y;
+                sending = true;
+            } else if (sending) {
+                SendUartRaw("x0.00 y0.00");
+                sending = false;
+                if (hit_safety_cap) {
+                    ESP_LOGW(TAG, "持续运动已到 60 秒上限，自动停车");
+                } else if (expired) {
+                    ESP_LOGI(TAG, "底盘运动结束，已主动停车");
+                }
+            }
+        }
     }
 
     void InitializeTools() {
@@ -226,27 +414,64 @@ private:
             }
         });
 
-        mcp_server.AddTool("self.chassis.go_forward", "前进", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            SendUartMessage("x0.0 y1.0");
+        // 说明：底盘只认"速度"，不认"距离"。持续时长由头部负责计时与主动停车，
+        // 参数 duration 让模型能按"走多远"自行选择秒数（1 秒约 30~40 厘米）。
+        PropertyList motion_args = PropertyList({
+            Property("duration", kPropertyTypeInteger, 2, 1, 10)
+        });
+
+        mcp_server.AddTool("self.chassis.move", "让小车一直按指定速度走，直到调用停车工具或 60 秒上限。speed 正数前进、负数后退；turn 正数右转、负数左转；都是 -100~100 的百分比。用户说“一直往前走”“继续走”“开快点”时用这个", PropertyList({
+            Property("speed", kPropertyTypeInteger, 100, -100, 100),
+            Property("turn", kPropertyTypeInteger, 0, -100, 100)
+        }), [this](const PropertyList& properties) -> ReturnValue {
+            int speed = properties["speed"].value<int>();
+            int turn = properties["turn"].value<int>();
+            if (speed == 0 && turn == 0) {
+                StopMotion();
+            } else {
+                StartMotion(turn / 100.0f, speed / 100.0f, 0);
+            }
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.go_back", "后退", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            SendUartMessage("x0.0 y-1.0");
+        mcp_server.AddTool("self.chassis.go_forward", "向前走一小段（走完自动停）。duration 为持续秒数（1-10），越大走得越远。用户只说“走一步”“往前挪一点”时用这个；要一直走请用 move", motion_args, [this](const PropertyList& properties) -> ReturnValue {
+            StartMotion(0.0f, cruise_speed_ / 100.0f, properties["duration"].value<int>() * 1000);
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.turn_left", "向左转", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            SendUartMessage("x-1.0 y0.0");
+        mcp_server.AddTool("self.chassis.go_back", "向后退一小段（退完自动停）。duration 为持续秒数（1-10）", motion_args, [this](const PropertyList& properties) -> ReturnValue {
+            StartMotion(0.0f, -cruise_speed_ / 100.0f, properties["duration"].value<int>() * 1000);
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.turn_right", "向右转", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            SendUartMessage("x1.0 y0.0");
+        mcp_server.AddTool("self.chassis.turn_left", "原地左转一小段（转完自动停）。duration 为持续秒数（1-10），越大转得越多", motion_args, [this](const PropertyList& properties) -> ReturnValue {
+            StartMotion(-1.0f, 0.0f, properties["duration"].value<int>() * 1000);
             return true;
         });
-        
+
+        mcp_server.AddTool("self.chassis.turn_right", "原地右转一小段（转完自动停）。duration 为持续秒数（1-10），越大转得越多", motion_args, [this](const PropertyList& properties) -> ReturnValue {
+            StartMotion(1.0f, 0.0f, properties["duration"].value<int>() * 1000);
+            return true;
+        });
+
+        mcp_server.AddTool("self.chassis.stop", "立即停止底盘运动", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            StopMotion();
+            return true;
+        });
+
+        mcp_server.AddTool("self.chassis.set_speed", "设置底盘速度百分比（10-100），会存下来供以后的移动使用；正在走时立即改速。调之前可以先调 get_status 看当前值", PropertyList({
+            Property("percent", kPropertyTypeInteger, 10, 100)
+        }), [this](const PropertyList& properties) -> ReturnValue {
+            SetCruiseSpeed(properties["percent"].value<int>());
+            return true;
+        });
+
+        mcp_server.AddTool("self.chassis.get_status", "获取底盘当前状态：是否在动、是否一直走、当前转向/速度百分比、巡航速度", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return GetMotionStatusJson();
+        });
+
         mcp_server.AddTool("self.chassis.dance", "跳舞", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            StopMotion();  // 底盘跳舞期间不读串口，先停掉重发任务避免指令堆积
             SendUartMessage("d1");
             light_mode_ = LIGHT_MODE_MAX;
             return true;
@@ -312,6 +537,8 @@ public:
         // 若影响语音功能，注释掉下面这段即可关闭
         WifiRemoteControl::Start(
             [this](const std::string& cmd) {
+                // 手机摇杆一接管就取消语音设定的持续运动，否则松手后车又被重发指令带跑
+                StopMotion();
                 SendUartMessage(cmd.c_str());
             },
             [this](size_t* len) -> uint8_t* {
