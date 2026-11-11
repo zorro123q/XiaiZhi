@@ -129,6 +129,36 @@ private:
             }
             app.ToggleChatState();
         });
+
+#if CONFIG_USE_SERVER_AEC
+        // 实时对话（服务器端 AEC）开关。本板只有一颗 ES8311，没有回声参考通道，
+        // 所以用不了设备端 AEC（CONFIG_USE_DEVICE_AEC），只能让服务器拿它自己下发的
+        // TTS 做参考来消回声。开启后设备播放回复时保持拾音，可以直接说话打断。
+        // 用长按而不是双击：注册双击会让上面单击的响应多等一个双击窗口，伤手感。
+        boot_button_.OnLongPress([this]() {
+            auto& app = Application::GetInstance();
+            if (app.GetDeviceState() != kDeviceStateIdle) {
+                return;
+            }
+            bool turn_on = app.GetAecMode() == kAecOff;
+            app.SetAecMode(turn_on ? kAecOnServerSide : kAecOff);
+            Settings settings("sparkbot", true);
+            settings.SetBool("realtime", turn_on);
+            ESP_LOGI(TAG, "Realtime conversation %s (saved)", turn_on ? "enabled" : "disabled");
+        });
+
+        // 开机恢复上次的选择。默认构造出来就是开启态，所以只有"关闭"需要动作，
+        // 正常开启时不去碰它，免得开机白弹一条通知。
+        {
+            Settings settings("sparkbot", false);
+            bool realtime = settings.GetBool("realtime", true);
+            if (!realtime) {
+                Application::GetInstance().SetAecMode(kAecOff);
+            }
+            ESP_LOGI(TAG, "Realtime conversation (server AEC) %s, long-press BOOT to toggle",
+                     realtime ? "enabled" : "disabled");
+        }
+#endif
     }
 
     void InitializeDisplay() {
