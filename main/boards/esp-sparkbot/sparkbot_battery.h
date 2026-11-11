@@ -133,6 +133,7 @@ private:
     static constexpr int kWindowSize = 10;   // 10 次采样做平均（约 10 秒）
     static constexpr int kFailLimit = 5;     // 连续失败次数上限
     static constexpr int kTrendSize = 6;     // 充电趋势窗口：6 × 10 秒 = 60 秒
+    static constexpr int kNoBatteryMillivolt = 2800;  // 低于此电压视为未装电池
 
     // 单节锂电池放电曲线（静置电压 -> 电量）
     struct CurvePoint {
@@ -217,6 +218,17 @@ private:
             sum += samples_mv_[i];
         }
         last_mv_ = sum / sample_count_;
+
+        // 电压过低：主体没装电池（仅靠底盘磁吸 5V 供电）时采样点悬空，
+        // 这时不能当成 0% 处理，否则会一直误报"请充电"
+        if (last_mv_ < kNoBatteryMillivolt) {
+            if (valid_) {
+                ESP_LOGW(BATTERY_TAG, "电池电压仅 %d mV，判定为主体内未装电池，不显示电量", last_mv_);
+            }
+            valid_ = false;
+            return;
+        }
+
         valid_ = true;
 
         UpdateLevel(last_mv_);
