@@ -9,6 +9,7 @@
 
 #include <wifi_station.h>
 #include <esp_log.h>
+#include <esp_timer.h>
 #include <esp_lcd_panel_vendor.h>
 #include <driver/i2c_master.h>
 #include <driver/spi_common.h>
@@ -72,6 +73,13 @@ private:
     static constexpr int kMotionResendMs = 100;   // 看门狗 500ms，100ms 重发留足余量
     static constexpr int kMotionStackSize = 3072;
     static constexpr int kContinuousMaxMs = 60000;  // 无限运动的安全上限：60 秒
+
+    // 跳舞灯光联动：底盘是单向串口（只发不收），跳舞何时结束拿不到回执，
+    // 只能按约定时长开一次性定时器，到点由 OnDanceLightTimeout 把灯切回休眠。
+    // 期间若用户手动切换灯光，会取消定时器，避免把用户选的模式又覆盖回休眠。
+    esp_timer_handle_t dance_light_timer_ = nullptr;
+    bool dance_light_pending_ = false;
+    static constexpr int kDanceLightDefaultSec = 12;
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -226,6 +234,18 @@ private:
 
         SendUartMessage("w2");
 
+        // 跳舞结束的灯光回调：一次性定时器，到点把底盘灯切回休眠
+        esp_timer_create_args_t dance_timer_args = {
+            .callback = [](void* arg) {
+                static_cast<EspSparkBot*>(arg)->OnDanceLightTimeout();
+            },
+            .arg = this,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "dance_light",
+            .skip_unhandled_events = true,
+        };
+        ESP_ERROR_CHECK(esp_timer_create(&dance_timer_args, &dance_light_timer_));
+
         // 巡航速度从 NVS 恢复（set_speed 工具会写进去）
         Settings settings("sparkbot", false);
         int stored_speed = settings.GetInt("cruise-speed", 100);
@@ -240,6 +260,41 @@ private:
         uint8_t len = strlen(command_str);
         uart_write_bytes(ECHO_UART_PORT_NUM, command_str, len);
         ESP_LOGI(TAG, "Sent command: %s", command_str);
+    }
+
+    // 跳舞开始：点亮灯光秀(w7)，并预定 duration_sec 秒后切休眠(w8)
+    void StartDanceLight(int duration_sec) {
+        SendUartMessage("w7");
+        light_mode_ = LIGHT_MODE_SHOW;
+        if (dance_light_timer_ == nullptr) {
+            ESP_LOGW(TAG, "跳舞灯光定时器未就绪，本次不做联动");
+            return;
+        }
+        esp_timer_stop(dance_light_timer_);
+        esp_timer_start_once(dance_light_timer_,
+                             static_cast<uint64_t>(duration_sec) * 1000000ULL);
+        dance_light_pending_ = true;
+        ESP_LOGI(TAG, "跳舞灯光：切到灯秀，%d 秒后切休眠", duration_sec);
+    }
+
+    // 用户手动切灯时调用：取消"到点切回休眠"，别把用户的选覆盖掉
+    void CancelDanceLight() {
+        if (dance_light_timer_ == nullptr) {
+            return;
+        }
+        // 用返回值判断是否真的取消了（未运行/已触发完成时返回错误码，幂等）
+        if (esp_timer_stop(dance_light_timer_) == ESP_OK) {
+            dance_light_pending_ = false;
+            ESP_LOGI(TAG, "跳舞灯光联动已取消");
+        }
+    }
+
+    // esp_timer 任务上下文：只发串口 + 改状态，不做阻塞操作
+    void OnDanceLightTimeout() {
+        dance_light_pending_ = false;
+        SendUartMessage("w8");
+        light_mode_ = LIGHT_MODE_SLEEP;
+        ESP_LOGI(TAG, "跳舞结束，灯光切回休眠");
     }
 
     // 周期重发的指令不打日志，否则一串口就刷屏
@@ -406,12 +461,8 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         // 定义设备的属性
-        mcp_server.AddTool("self.chassis.get_light_mode", "获取灯光效果编号", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            if (light_mode_ < 2) {
-                return 1;
-            } else {
-                return light_mode_ - 2;
-            }
+        mcp_server.AddTool("self.chassis.get_light_mode", "获取当前灯光效果编号（3=闪烁 4=慢呼吸 5=快呼吸 6=流水 7=灯秀 8=休眠；0-2 为充电/低电/常亮等自动模式）", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return static_cast<int>(light_mode_);
         });
 
         // 说明：底盘只认"速度"，不认"距离"。持续时长由头部负责计时与主动停车，
@@ -470,27 +521,28 @@ private:
             return GetMotionStatusJson();
         });
 
-        mcp_server.AddTool("self.chassis.dance", "跳舞", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+        mcp_server.AddTool("self.chassis.dance", "跳舞。跳舞期间自动开启灯光秀，跳完自动切回休眠灯。duration 为舞蹈持续秒数（默认 12，用户说“跳久一点”可调大）", PropertyList({
+            Property("duration", kPropertyTypeInteger, kDanceLightDefaultSec, 3, 60)
+        }), [this](const PropertyList& properties) -> ReturnValue {
             StopMotion();  // 底盘跳舞期间不读串口，先停掉重发任务避免指令堆积
             SendUartMessage("d1");
-            light_mode_ = LIGHT_MODE_MAX;
+            StartDanceLight(properties["duration"].value<int>());
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.switch_light_mode", "打开灯光效果", PropertyList({
-            Property("light_mode", kPropertyTypeInteger, 1, 6)
+        mcp_server.AddTool("self.chassis.switch_light_mode", "切换灯光效果。3=闪烁 4=白色慢呼吸 5=白色快呼吸 6=流水 7=灯光秀 8=休眠。用户说“第一种/第 N 种”时，第 1 种对应 3，依次类推", PropertyList({
+            Property("light_mode", kPropertyTypeInteger, 3, 8)
         }), [this](const PropertyList& properties) -> ReturnValue {
-            char command_str[5] = {'w', 0, 0};
-            char mode = static_cast<light_mode_t>(properties["light_mode"].value<int>());
+            int mode = properties["light_mode"].value<int>();
+            char command_str[3] = {'w', static_cast<char>(mode + '0'), 0};
 
-            ESP_LOGI(TAG, "Switch Light Mode: %c", (mode + '0'));
+            ESP_LOGI(TAG, "Switch Light Mode: %d", mode);
 
-            if (mode >= 3 && mode <= 8) {
-                command_str[1] = mode + '0';
-                SendUartMessage(command_str);
-                return true;
-            }
-            throw std::runtime_error("Invalid light mode");
+            SendUartMessage(command_str);
+            // 手动切灯优先：取消跳舞结束后“切回休眠”的预定动作
+            CancelDanceLight();
+            light_mode_ = static_cast<light_mode_t>(mode);
+            return true;
         });
 
         mcp_server.AddTool("self.camera.set_camera_flipped", "翻转摄像头图像方向", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
