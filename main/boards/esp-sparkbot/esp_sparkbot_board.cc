@@ -59,6 +59,8 @@ private:
     Esp32Camera* camera_;
     SparkBotBattery* battery_ = nullptr;
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
+    // 跳舞前用户选的模式，舞毕恢复。原来固定切休眠会把用户设置吞掉
+    light_mode_t pre_dance_light_mode_ = LIGHT_MODE_ALWAYS_ON;
 
     // 底盘运动状态。底盘的串口看门狗约 500ms 收不到指令就自动刹停（见
     // c2_tracked_chassis/main/tracked_chassis.c 的 uart_read_count > 25），
@@ -274,7 +276,10 @@ private:
         ESP_ERROR_CHECK(uart_param_config(ECHO_UART_PORT_NUM, &uart_config));
         ESP_ERROR_CHECK(uart_set_pin(ECHO_UART_PORT_NUM, UART_ECHO_TXD, UART_ECHO_RXD, UART_ECHO_RTS, UART_ECHO_CTS));
 
-        SendUartMessage("w2");
+        // 开机默认常亮：指令由 light_mode_ 派生，避免和成员初值改动后不同步
+        char init_light_cmd[3] = {
+            'w', static_cast<char>(static_cast<int>(light_mode_) + '0'), 0};
+        SendUartMessage(init_light_cmd);
 
         // 跳舞结束的灯光回调：一次性定时器，到点把底盘灯切回休眠
         esp_timer_create_args_t dance_timer_args = {
@@ -310,19 +315,38 @@ private:
         xTaskCreate(MotionTaskEntry, "chassis_motion", kMotionStackSize, this, 5, nullptr);
     }
 
+    // 编号 → 中文名。给模型看的返回值必须自带名字：
+    // 只回一个裸数字 2，模型会自己脑补成"第 2 种"再换算成 w4，就是之前错位的根源。
+    static const char* LightModeName(light_mode_t mode) {
+        switch (mode) {
+            case LIGHT_MODE_CHARGING_BREATH:   return "充电呼吸";
+            case LIGHT_MODE_POWER_LOW:         return "低电提示";
+            case LIGHT_MODE_ALWAYS_ON:         return "常亮";
+            case LIGHT_MODE_BLINK:             return "闪烁";
+            case LIGHT_MODE_WHITE_BREATH_SLOW: return "白色慢呼吸";
+            case LIGHT_MODE_WHITE_BREATH_FAST: return "白色快呼吸";
+            case LIGHT_MODE_FLOWING:           return "流水";
+            case LIGHT_MODE_SHOW:              return "灯光秀";
+            case LIGHT_MODE_SLEEP:             return "休眠";
+            default:                           return "未知";
+        }
+    }
+
     void SendUartMessage(const char * command_str) {
         uint8_t len = strlen(command_str);
         uart_write_bytes(ECHO_UART_PORT_NUM, command_str, len);
         ESP_LOGI(TAG, "Sent command: %s", command_str);
     }
 
-    // 跳舞开始：立刻点亮灯秀(w7)，错峰后再发跳舞指令(d1)，total_sec 秒后切休眠(w8)
+    // 跳舞开始：立刻点亮灯秀(w7)，错峰后再发跳舞指令(d1)，舞毕恢复跳舞前的模式
     void StartDanceSequence(int total_sec) {
         if (dance_light_timer_ == nullptr || dance_cmd_timer_ == nullptr) {
             ESP_LOGW(TAG, "跳舞灯光定时器未就绪，本次不做联动");
             SendUartMessage("d1");
             return;
         }
+        // 记下用户跳舞前的选择，舞毕恢复；必须写在下面覆盖 light_mode_ 之前
+        pre_dance_light_mode_ = light_mode_;
         // 1) 先点灯，再跳舞。反过来的话 d1 会阻塞底盘 15.8 秒不读串口，
         //    w7 得等舞蹈结束才被处理（实测表现：跳完才亮）
         SendUartMessage("w7");
@@ -330,12 +354,14 @@ private:
         // 2) 错峰 150ms 再发 d1，避免两条命令粘成 "w7d1" 被 sscanf 只吃掉第一条
         esp_timer_stop(dance_cmd_timer_);
         esp_timer_start_once(dance_cmd_timer_, static_cast<uint64_t>(kDanceCmdGapMs) * 1000ULL);
-        // 3) 舞蹈跑完再切休眠
+        // 3) 舞蹈跑完再恢复跳舞前的模式
         esp_timer_stop(dance_light_timer_);
         esp_timer_start_once(dance_light_timer_,
                              static_cast<uint64_t>(total_sec) * 1000000ULL);
-        ESP_LOGI(TAG, "跳舞灯光：已切灯秀，%dms 后发 d1，%d 秒后切休眠",
-                 kDanceCmdGapMs, total_sec);
+        ESP_LOGI(TAG, "跳舞灯光：已切灯秀，%dms 后发 d1，%d 秒后恢复到 %d(%s)",
+                 kDanceCmdGapMs, total_sec,
+                 static_cast<int>(pre_dance_light_mode_),
+                 LightModeName(pre_dance_light_mode_));
     }
 
     // 错峰到点，此时 w7 已被底盘读走，d1 单独成帧
@@ -343,7 +369,7 @@ private:
         SendUartMessage("d1");
     }
 
-    // 用户手动切灯时调用：取消"到点切回休眠"，别把用户的选覆盖掉。
+    // 用户手动切灯时调用：取消"舞毕恢复"的预定动作，别把用户的新选择覆盖掉。
     // 注意不动 dance_cmd_timer_：切灯不该打断已经在进行的跳舞。
     void CancelDanceLight() {
         if (dance_light_timer_ == nullptr) {
@@ -357,9 +383,15 @@ private:
 
     // esp_timer 任务上下文：只发串口 + 改状态，不做阻塞操作
     void OnDanceLightTimeout() {
-        SendUartMessage("w8");
-        light_mode_ = LIGHT_MODE_SLEEP;
-        ESP_LOGI(TAG, "跳舞结束，灯光切回休眠");
+        // 恢复跳舞前的模式，而不是写死 w8。
+        // 旧实现无条件切休眠，用户跳完就从"常亮/慢呼吸"掉到近乎全灭，
+        // 体感像"逻辑断了"。
+        light_mode_t restore = pre_dance_light_mode_;
+        char command_str[3] = {'w', static_cast<char>(static_cast<int>(restore) + '0'), 0};
+        SendUartMessage(command_str);
+        light_mode_ = restore;
+        ESP_LOGI(TAG, "跳舞结束，灯光恢复到 %d(%s)",
+                 static_cast<int>(restore), LightModeName(restore));
     }
 
     // 周期重发的指令不打日志，否则一串口就刷屏
@@ -526,8 +558,13 @@ private:
     void InitializeTools() {
         auto& mcp_server = McpServer::GetInstance();
         // 定义设备的属性
-        mcp_server.AddTool("self.chassis.get_light_mode", "获取当前灯光效果编号（3=闪烁 4=慢呼吸 5=快呼吸 6=流水 7=灯秀 8=休眠；0-2 为充电/低电/常亮等自动模式）", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            return static_cast<int>(light_mode_);
+        // 返回值带上中文名，别只回裸整数：模型拿到 2 会当"第 2 种"再 +2 换算出 w4。
+        // 编号就是底盘协议号，读写同一套，不做任何序号换算。
+        mcp_server.AddTool("self.chassis.get_light_mode", "获取当前灯光模式，返回“编号(名称)”，例如 2(常亮)。这个编号和 switch_light_mode 的参数是同一套，直接原样转述给用户", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "%d(%s)",
+                     static_cast<int>(light_mode_), LightModeName(light_mode_));
+            return std::string(buf);
         });
 
         // 说明：底盘只认"速度"，不认"距离"。持续时长由头部负责计时与主动停车，
@@ -586,7 +623,7 @@ private:
             return GetMotionStatusJson();
         });
 
-        mcp_server.AddTool("self.chassis.dance", "跳舞。开跳前先点亮灯光秀，舞蹈结束后自动切回休眠灯。底盘舞蹈动作表固定约 16 秒，通常不用传 duration", PropertyList({
+        mcp_server.AddTool("self.chassis.dance", "跳舞。开跳前先点亮灯光秀，舞蹈结束后自动恢复到跳舞前的灯光模式。底盘舞蹈动作表固定约 16 秒，通常不用传 duration", PropertyList({
             Property("duration", kPropertyTypeInteger, kDanceLightDefaultSec, 15, 60)
         }), [this](const PropertyList& properties) -> ReturnValue {
             StopMotion();  // 底盘跳舞期间不读串口，先停掉重发任务避免指令堆积
@@ -594,16 +631,26 @@ private:
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.switch_light_mode", "切换灯光效果。3=闪烁 4=白色慢呼吸 5=白色快呼吸 6=流水 7=灯光秀 8=休眠。用户说“第一种/第 N 种”时，第 1 种对应 3，依次类推", PropertyList({
-            Property("light_mode", kPropertyTypeInteger, 3, 8)
+        mcp_server.AddTool("self.chassis.switch_light_mode",
+            "切换底盘灯光。参数 light_mode 就是底盘协议编号，与 get_light_mode 返回的编号完全一致："
+            "用户说“模式 N”“第 N 号”就直接传 N，不做任何加减换算。"
+            "0=充电呼吸 1=低电提示 2=常亮 3=闪烁 4=白色慢呼吸 5=白色快呼吸 6=流水 7=灯光秀 8=休眠。"
+            "注意 0/1 由电池状态自动驱动，手动切过去会被覆盖，一般不要用",
+            PropertyList({
+            Property("light_mode", kPropertyTypeInteger, 2, 0, 8)
         }), [this](const PropertyList& properties) -> ReturnValue {
             int mode = properties["light_mode"].value<int>();
+            if (mode < 0 || mode >= LIGHT_MODE_MAX) {
+                ESP_LOGW(TAG, "非法灯光模式: %d", mode);
+                return false;
+            }
             char command_str[3] = {'w', static_cast<char>(mode + '0'), 0};
 
-            ESP_LOGI(TAG, "Switch Light Mode: %d", mode);
+            ESP_LOGI(TAG, "Switch Light Mode: %d(%s)", mode,
+                     LightModeName(static_cast<light_mode_t>(mode)));
 
             SendUartMessage(command_str);
-            // 手动切灯优先：取消跳舞结束后“切回休眠”的预定动作
+            // 手动切灯优先：取消跳舞结束后“恢复原模式”的预定动作
             CancelDanceLight();
             light_mode_ = static_cast<light_mode_t>(mode);
             return true;
