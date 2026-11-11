@@ -22,7 +22,7 @@ jobs:
       BOARD: ${{ inputs.board || 'esp-sparkbot' }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Build
         shell: bash
@@ -31,7 +31,7 @@ jobs:
           python scripts/release.py "$BOARD"
 
       - name: Upload merged bin
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: xiaozhi-${{ env.BOARD }}-merged
           path: build/merged-binary.bin
