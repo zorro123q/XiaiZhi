@@ -75,16 +75,23 @@ private:
     static constexpr int kContinuousMaxMs = 60000;  // 无限运动的安全上限：60 秒
 
     // 跳舞灯光联动：底盘是单向串口（只发不收），跳舞何时结束拿不到回执，
-    // 只能按约定时长开一次性定时器，到点由 OnDanceLightTimeout 把灯切回休眠。
-    // 期间若用户手动切换灯光，会取消定时器，避免把用户选的模式又覆盖回休眠。
+    // 只能按固件里写死的动作表时长开一次性定时器，到点由 OnDanceLightTimeout 切休眠。
     //
-    // w7 必须与 d1 错开发送：底盘协议无分隔符、按字符流解析，两条命令同毫秒
-    // 发出会在总线上连成 "d1w7"，底盘只会执行第一条，w7 被静默丢弃。
-    esp_timer_handle_t dance_show_timer_ = nullptr;   // d1 → w7 的错峰延时
+    // 命令顺序必须是 w7 → d1，不能反过来：
+    //   c2_tracked_chassis 的 echo_task 收到 'd' 后同步调用 spark_bot_dance()，
+    //   内部 vTaskDelay 逐段跑完整套动作（合计 kDanceDurationMs），期间完全不执行
+    //   uart_read_bytes。此时再发的 w7 只会躺在 RX 缓冲里，等舞蹈结束才被读到——
+    //   实测表现就是"跳完了才亮灯"。
+    //
+    // 两条命令还必须错峰：底盘用 sscanf("%c%f") 只解析第一组命令，
+    // 同毫秒发出会在总线上连成 "w7d1"，第二条被静默丢弃。
+    esp_timer_handle_t dance_cmd_timer_ = nullptr;    // w7 → d1 的错峰延时
     esp_timer_handle_t dance_light_timer_ = nullptr;  // 舞蹈结束 → w8
-    bool dance_light_pending_ = false;
-    static constexpr int kDanceLightDefaultSec = 12;
-    static constexpr int kDanceShowGapMs = 150;       // 错峰时长，够底盘吃完 d1
+    // 底盘舞蹈固定时长：motion_control.c 的 dance_moves 表逐项求和，两段各 7900ms
+    static constexpr int kDanceDurationMs = 15800;
+    // 向上取整到秒（15800 → 16s），多出的 200ms 正好当舞蹈结束后的缓冲
+    static constexpr int kDanceLightDefaultSec = (kDanceDurationMs + 999) / 1000;
+    static constexpr int kDanceCmdGapMs = 150;        // 错峰时长，够底盘吃完 w7
 
     void InitializeI2c() {
         // Initialize I2C peripheral
@@ -251,17 +258,17 @@ private:
         };
         ESP_ERROR_CHECK(esp_timer_create(&dance_timer_args, &dance_light_timer_));
 
-        // d1 → w7 的错峰定时器，避免两条命令在串口上粘成一条
-        esp_timer_create_args_t show_timer_args = {
+        // w7 → d1 的错峰定时器，避免两条命令在串口上粘成一条
+        esp_timer_create_args_t cmd_timer_args = {
             .callback = [](void* arg) {
-                static_cast<EspSparkBot*>(arg)->OnDanceShowTick();
+                static_cast<EspSparkBot*>(arg)->OnDanceCmdTick();
             },
             .arg = this,
             .dispatch_method = ESP_TIMER_TASK,
-            .name = "dance_show",
+            .name = "dance_cmd",
             .skip_unhandled_events = true,
         };
-        ESP_ERROR_CHECK(esp_timer_create(&show_timer_args, &dance_show_timer_));
+        ESP_ERROR_CHECK(esp_timer_create(&cmd_timer_args, &dance_cmd_timer_));
 
         // 巡航速度从 NVS 恢复（set_speed 工具会写进去）
         Settings settings("sparkbot", false);
@@ -279,48 +286,47 @@ private:
         ESP_LOGI(TAG, "Sent command: %s", command_str);
     }
 
-    // 跳舞开始：错峰点亮灯光秀(w7)，并预定 duration_sec 秒后切休眠(w8)
-    void StartDanceLight(int duration_sec) {
-        light_mode_ = LIGHT_MODE_SHOW;
-        if (dance_light_timer_ == nullptr || dance_show_timer_ == nullptr) {
+    // 跳舞开始：立刻点亮灯秀(w7)，错峰后再发跳舞指令(d1)，total_sec 秒后切休眠(w8)
+    void StartDanceSequence(int total_sec) {
+        if (dance_light_timer_ == nullptr || dance_cmd_timer_ == nullptr) {
             ESP_LOGW(TAG, "跳舞灯光定时器未就绪，本次不做联动");
+            SendUartMessage("d1");
             return;
         }
-        // 先排好 w7 的错峰发送，再排 w8 的收尾
-        esp_timer_stop(dance_show_timer_);
-        esp_timer_start_once(dance_show_timer_, static_cast<uint64_t>(kDanceShowGapMs) * 1000ULL);
-
+        // 1) 先点灯，再跳舞。反过来的话 d1 会阻塞底盘 15.8 秒不读串口，
+        //    w7 得等舞蹈结束才被处理（实测表现：跳完才亮）
+        SendUartMessage("w7");
+        light_mode_ = LIGHT_MODE_SHOW;
+        // 2) 错峰 150ms 再发 d1，避免两条命令粘成 "w7d1" 被 sscanf 只吃掉第一条
+        esp_timer_stop(dance_cmd_timer_);
+        esp_timer_start_once(dance_cmd_timer_, static_cast<uint64_t>(kDanceCmdGapMs) * 1000ULL);
+        // 3) 舞蹈跑完再切休眠
         esp_timer_stop(dance_light_timer_);
         esp_timer_start_once(dance_light_timer_,
-                             static_cast<uint64_t>(duration_sec) * 1000000ULL);
-        dance_light_pending_ = true;
-        ESP_LOGI(TAG, "跳舞灯光：%dms 后切灯秀，%d 秒后切休眠", kDanceShowGapMs, duration_sec);
+                             static_cast<uint64_t>(total_sec) * 1000000ULL);
+        ESP_LOGI(TAG, "跳舞灯光：已切灯秀，%dms 后发 d1，%d 秒后切休眠",
+                 kDanceCmdGapMs, total_sec);
     }
 
-    // 错峰到点，此时 d1 已被底盘读走，w7 单独成帧
-    void OnDanceShowTick() {
-        SendUartMessage("w7");
+    // 错峰到点，此时 w7 已被底盘读走，d1 单独成帧
+    void OnDanceCmdTick() {
+        SendUartMessage("d1");
     }
 
-    // 用户手动切灯时调用：取消"到点切回休眠"，别把用户的选覆盖掉
+    // 用户手动切灯时调用：取消"到点切回休眠"，别把用户的选覆盖掉。
+    // 注意不动 dance_cmd_timer_：切灯不该打断已经在进行的跳舞。
     void CancelDanceLight() {
         if (dance_light_timer_ == nullptr) {
             return;
         }
-        // w7 还没发出去也一并取消，否则会在用户切灯后把灯抢回灯秀
-        if (dance_show_timer_ != nullptr) {
-            esp_timer_stop(dance_show_timer_);
-        }
         // 用返回值判断是否真的取消了（未运行/已触发完成时返回错误码，幂等）
         if (esp_timer_stop(dance_light_timer_) == ESP_OK) {
-            dance_light_pending_ = false;
             ESP_LOGI(TAG, "跳舞灯光联动已取消");
         }
     }
 
     // esp_timer 任务上下文：只发串口 + 改状态，不做阻塞操作
     void OnDanceLightTimeout() {
-        dance_light_pending_ = false;
         SendUartMessage("w8");
         light_mode_ = LIGHT_MODE_SLEEP;
         ESP_LOGI(TAG, "跳舞结束，灯光切回休眠");
@@ -550,12 +556,11 @@ private:
             return GetMotionStatusJson();
         });
 
-        mcp_server.AddTool("self.chassis.dance", "跳舞。跳舞期间自动开启灯光秀，跳完自动切回休眠灯。duration 为舞蹈持续秒数（默认 12，用户说“跳久一点”可调大）", PropertyList({
-            Property("duration", kPropertyTypeInteger, kDanceLightDefaultSec, 3, 60)
+        mcp_server.AddTool("self.chassis.dance", "跳舞。开跳前先点亮灯光秀，舞蹈结束后自动切回休眠灯。底盘舞蹈动作表固定约 16 秒，通常不用传 duration", PropertyList({
+            Property("duration", kPropertyTypeInteger, kDanceLightDefaultSec, 15, 60)
         }), [this](const PropertyList& properties) -> ReturnValue {
             StopMotion();  // 底盘跳舞期间不读串口，先停掉重发任务避免指令堆积
-            SendUartMessage("d1");
-            StartDanceLight(properties["duration"].value<int>());
+            StartDanceSequence(properties["duration"].value<int>());
             return true;
         });
 
