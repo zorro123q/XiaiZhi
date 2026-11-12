@@ -144,7 +144,7 @@ const V3 kVerts[8] = {
 };
 
 struct Face {
-    int v[4];      // 四个顶点索引，按外面看是逆时针
+    int idx[4];    // 四个顶点索引（外部看逆时针）
     V3 normal;     // 外法线，用来做背面剔除和明暗
     V3 center;     // 面心
     V3 u, v;       // 面内两个正交方向，用来摆点数
@@ -261,7 +261,7 @@ void Render() {
 
         P2 p[4];
         for (int i = 0; i < 4; i++) {
-            p[i] = Project(view_v[face.v[i]]);
+            p[i] = Project(view_v[face.idx[i]]);
         }
         FillQuad(p[0], p[1], p[2], p[3], face_color);
 
@@ -361,13 +361,13 @@ void ProbeImu(i2c_master_bus_handle_t bus, Display* display) {
             i2c_master_bus_rm_device(dev);
         }
 
-        ESP_LOGI(TAG, "  发现设备 0x%02X，0x00 寄存器=%s0x%02X", addr,
-                 id_ok ? "" : "(读不到) ", chip_id);
+        ESP_LOGI(TAG, "  发现设备 0x%02X，0x00 寄存器=%s0x%02X", (unsigned)addr,
+                 id_ok ? "" : "(读不到) ", (unsigned)chip_id);
 
         int n = 0;
         if (used + 20 < sizeof(buf)) {  // 留余量，防止 used 溢出后 strlen 越界
             n = snprintf(buf + used, sizeof(buf) - used, "%s0x%02X=0x%02X",
-                         used ? " " : "", addr, id_ok ? chip_id : 0xFF);
+                         used ? " " : "", (unsigned)addr, id_ok ? (unsigned)chip_id : 0xFFu);
             if (n > 0) used += (size_t)n;
         }
     }
