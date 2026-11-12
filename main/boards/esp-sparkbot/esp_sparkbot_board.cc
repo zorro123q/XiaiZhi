@@ -61,6 +61,8 @@ private:
     uint32_t touch_last_press_ms_ = 0;
     Display* display_;
     Esp32Camera* camera_;
+    // 摄像头方向档位默认值：0 = 不镜像不翻转。见 ApplyCameraOrientation 注释
+    static constexpr int kCameraOrientDefault = 0;
     SparkBotBattery* battery_ = nullptr;
     light_mode_t light_mode_ = LIGHT_MODE_ALWAYS_ON;
     // 跳舞前用户选的模式，舞毕恢复。原来固定切休眠会把用户设置吞掉
@@ -361,11 +363,24 @@ private:
         
         camera_ = new Esp32Camera(camera_config);
 
+        // 摄像头方向：bit0 = 水平镜像(HMirror)，bit1 = 垂直翻转(VFlip)
+        //   0 = 正常(0/0)      1 = 水平镜像(1/0)
+        //   2 = 上下颠倒(0/1)   3 = 旋转180°(1/1)
+        // 本板的摄像头是正装的，所以默认 0；上游原版默认 3 是为了适配
+        // 摄像头物理倒装的复刻板，装到本板上会表现为画面上下颠倒。
         Settings settings("sparkbot", false);
-        // 考虑到部分复刻使用了不可动摄像头的设计，默认启用翻转
-        bool camera_flipped = static_cast<bool>(settings.GetInt("camera-flipped", 1));
-        camera_->SetHMirror(camera_flipped);
-        camera_->SetVFlip(camera_flipped);
+        int orient = settings.GetInt("camera-orient", kCameraOrientDefault);
+        ApplyCameraOrientation(orient);
+    }
+
+    void ApplyCameraOrientation(int orient) {
+        if (camera_ == nullptr) {
+            return;
+        }
+        orient &= 0x03;
+        camera_->SetHMirror((orient & 0x01) != 0);
+        camera_->SetVFlip((orient & 0x02) != 0);
+        ESP_LOGI(TAG, "Camera orientation: %d (hmirror=%d, vflip=%d)", orient, orient & 0x01, (orient >> 1) & 0x01);
     }
 
     // 电池电量检测：主体 PCB 的电池分压接在 ADC2_CH3(GPIO14)
@@ -884,17 +899,16 @@ private:
             return true;
         });
 
-        mcp_server.AddTool("self.camera.set_camera_flipped", "翻转摄像头图像方向", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+        mcp_server.AddTool("self.camera.set_camera_flipped", "翻转摄像头图像方向（在正常和旋转180°之间切换，用户说画面反了/倒了时调用）", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
             Settings settings("sparkbot", true);
-            // 考虑到部分复刻使用了不可动摄像头的设计，默认启用翻转
-            bool flipped = !static_cast<bool>(settings.GetInt("camera-flipped", 1));
-            
-            camera_->SetHMirror(flipped);
-            camera_->SetVFlip(flipped);
-            
-            settings.SetInt("camera-flipped", flipped ? 1 : 0);
-            
-            return true;
+            int orient = settings.GetInt("camera-orient", kCameraOrientDefault);
+            // 只做「正常 ↔ 旋转180°」互换，不碰镜像位，避免切一次变镜像再切一次变颠倒
+            int next = (orient == 0) ? 3 : 0;
+
+            ApplyCameraOrientation(next);
+            settings.SetInt("camera-orient", next);
+
+            return next == 0 ? std::string("摄像头已恢复正常方向") : std::string("摄像头已旋转180°");
         });
 
         mcp_server.AddTool("self.battery.get_level", "获取设备电池电量（百分比）以及是否正在充电", PropertyList(),
