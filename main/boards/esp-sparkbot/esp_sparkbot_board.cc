@@ -3,6 +3,7 @@
 #include "display/lcd_display.h"
 #include "application.h"
 #include "button.h"
+#include "touch_element/touch_button.h"
 #include "config.h"
 #include "mcp_server.h"
 #include "settings.h"
@@ -55,6 +56,9 @@ class EspSparkBot : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
+    // 顶部触摸键：双击 = 打断当前播报并立刻继续聆听
+    touch_button_handle_t touch_top_ = nullptr;
+    uint32_t touch_last_press_ms_ = 0;
     Display* display_;
     Esp32Camera* camera_;
     SparkBotBattery* battery_ = nullptr;
@@ -175,6 +179,75 @@ private:
                      realtime ? "enabled" : "disabled");
         }
 #endif
+    }
+
+    // touch_element 的回调是 C 函数指针，用订阅时塞的 arg 把 this 带回来
+    static void TouchTopCallback(touch_button_handle_t handle, touch_button_message_t* message, void* arg) {
+        (void)handle;  // 只挂了一个键，用不上句柄
+        auto self = static_cast<EspSparkBot*>(arg);
+        if (self != nullptr && message != nullptr) {
+            self->OnTouchTopEvent(message);
+        }
+    }
+
+    /*
+        只认双击，单击故意不做任何事。
+        理由：只要注册了"单击要等双击窗口结束才生效"这套逻辑，单击必然带
+        TOUCH_DOUBLE_CLICK_MS 的延迟；而这 3 个触摸键在本固件里原本一个都没
+        接过功能，不做单击等于零代价，还省掉了"这一下到底是单击还是双击"
+        的二选一状态机。
+    */
+    void OnTouchTopEvent(touch_button_message_t* message) {
+        if (message->event != TOUCH_BUTTON_EVT_ON_PRESS) {
+            return;
+        }
+
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        bool is_double_click = (touch_last_press_ms_ != 0) &&
+                               (now_ms - touch_last_press_ms_ < TOUCH_DOUBLE_CLICK_MS);
+        if (!is_double_click) {
+            touch_last_press_ms_ = now_ms;
+            return;
+        }
+
+        // 清零，免得连按三下再触发一次
+        touch_last_press_ms_ = 0;
+
+        auto& app = Application::GetInstance();
+        // 只在播报时动手。Idle 下 StartListening() 会直接开麦，误触代价太大。
+        if (app.GetDeviceState() != kDeviceStateSpeaking) {
+            ESP_LOGI(TAG, "Touch double-click ignored, state=%d", static_cast<int>(app.GetDeviceState()));
+            return;
+        }
+        ESP_LOGI(TAG, "Touch double-click: abort speaking, keep listening");
+        // StartListening() 在 Speaking 状态下就是 AbortSpeaking + 切手动聆听模式，
+        // 正好是"打断并立刻能接着说话"。它内部走 Schedule() 投递到主任务，
+        // 所以在触摸任务上下文里调用是安全的，不会阻塞事件循环。
+        app.StartListening();
+    }
+
+    void InitializeTouchButton() {
+        touch_elem_global_config_t global_config = TOUCH_ELEM_GLOBAL_DEFAULT_CONFIG();
+        ESP_ERROR_CHECK(touch_element_install(&global_config));
+
+        touch_button_global_config_t button_global_config = TOUCH_BUTTON_GLOBAL_DEFAULT_CONFIG();
+        ESP_ERROR_CHECK(touch_button_install(&button_global_config));
+
+        touch_button_config_t button_config = {
+            .channel_num = TOUCH_PAD_NUM1,
+            .channel_sens = TOUCH_TOP_SENSITIVITY
+        };
+        ESP_ERROR_CHECK(touch_button_create(&button_config, &touch_top_));
+        ESP_ERROR_CHECK(touch_button_subscribe_event(touch_top_,
+                                                     TOUCH_ELEM_EVENT_ON_PRESS,
+                                                     static_cast<void*>(this)));
+        ESP_ERROR_CHECK(touch_button_set_dispatch_method(touch_top_, TOUCH_ELEM_DISP_CALLBACK));
+        ESP_ERROR_CHECK(touch_button_set_callback(touch_top_, TouchTopCallback));
+        // 长按阈值放到 3 秒：双击之后手指还搭在上面时，不要被识别成长按之类
+        ESP_ERROR_CHECK(touch_button_set_longpress(touch_top_, 3000));
+        ESP_ERROR_CHECK(touch_element_start());
+
+        ESP_LOGI(TAG, "Top touch button ready (double-click to interrupt)");
     }
 
     void InitializeDisplay() {
@@ -807,6 +880,7 @@ public:
         InitializeSpi();
         InitializeDisplay();
         InitializeButtons();
+        InitializeTouchButton();
         InitializeCamera();
         InitializeBattery();
         InitializeEchoUart();

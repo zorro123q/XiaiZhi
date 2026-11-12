@@ -24,6 +24,20 @@
 #define VOLUME_UP_BUTTON_GPIO   GPIO_NUM_NC
 #define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
 
+/*
+    顶部触摸键（双击打断）
+    机头的触摸片是 FPC 贴在结构件上的，被摄像头挤成了左右两块、串接在同一个引脚上，
+    对应 TOUCH_PAD_NUM1 —— ESP32-S3 上就是 GPIO1。本固件里 GPIO1/2/3 全部空闲
+    （I2S 占 39-42、I2C 占 4/5、SPI 占 21/43/44/47、UART 占 38/48、PA 占 46、
+    ADC 占 14、摄像头占 6-18），所以不冲突。
+    左右侧面还各有一个键（NUM2/NUM3），本固件暂不接管。
+    灵敏度沿用官方 BSP 的取值：顶部两块并联面积大，用 0.04 压低防误触。
+*/
+#define TOUCH_TOP_SENSITIVITY   0.04F
+// 两次"按下"的最大间隔，超过就当成两次独立的按下。
+// 太小按不出来，太大容易把两次无意的触碰判成双击。
+#define TOUCH_DOUBLE_CLICK_MS   350
+
 #define DISPLAY_WIDTH   240
 #define DISPLAY_HEIGHT  240
 #define DISPLAY_MIRROR_X false

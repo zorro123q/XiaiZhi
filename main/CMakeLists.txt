@@ -307,6 +307,10 @@ endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
+                    # touch_element 是 IDF 内置组件，不像 espressif/button 那样能从
+                    # idf_component.yml 自动注入依赖，必须在这里显式声明，
+                    # 否则 touch_element/touch_button.h 直接找不到。
+                    PRIV_REQUIRES touch_element
                     WHOLE_ARCHIVE
                     )
 
