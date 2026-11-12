@@ -24,6 +24,7 @@
 #include "esp32_camera.h"
 #include "wifi_remote_control.h"
 #include "sparkbot_battery.h"
+#include "cube_view.h"
 
 #define TAG "esp_sparkbot"
 
@@ -922,6 +923,31 @@ private:
                 return std::string("{\"level\":") + std::to_string(level) +
                        ",\"charging\":" + (charging ? "true" : "false") + "}";
             });
+
+        // ── 3D 骰子：屏幕玩具 ────────────────────────────────────────
+        // 渲染完全自己算（软光栅），不占用音频/网络的算力，但会持续刷屏。
+        // 所以工具描述里要提醒模型：这是"展示模式"，要退出得显式调用 hide。
+        mcp_server.AddTool("self.cube.show",
+            "在屏幕上显示一个 3D 骰子，目前会自己慢慢转动。"
+            "用户说“显示一个立方体”“玩骰子”“把骰子拿出来”“打开那个方块”时调用。"
+            "显示期间屏幕会被骰子占满（状态栏也看不到），要看别的内容必须先调 self.cube.hide",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                cubetoy::Show();
+                return std::string("骰子已经显示在屏幕上，正在自转。要看别的画面记得调用 self.cube.hide");
+            });
+
+        mcp_server.AddTool("self.cube.hide", "关闭屏幕上的 3D 骰子，恢复正常界面",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                cubetoy::Hide();
+                return std::string("骰子已关闭，恢复正常界面");
+            });
+
+        mcp_server.AddTool("self.imu.probe_info",
+            "查询开机时对 I2C 总线的扫描结果，用来确认板上的 IMU（陀螺仪）芯片型号。"
+            "用户问“有没有陀螺仪”“IMU 是什么型号”“传感器找到了吗”时用它",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                return cubetoy::GetProbeSummary();
+            });
     }
 
 public:
@@ -929,6 +955,11 @@ public:
         InitializeI2c();
         InitializeSpi();
         InitializeDisplay();
+        // 3D 骰子玩具：自带软光栅，不依赖 tinyGL / LVGL 旧接口。
+        // 上电顺手扫一遍 I2C，把发现的地址和芯片 ID 打进日志——
+        // 官方文档对 IMU 型号说法不一致，用实测结果定第 2 轮接哪个驱动。
+        cubetoy::ProbeImu(i2c_bus_, display_);
+        cubetoy::Init(display_);
         InitializeButtons();
         InitializeTouchButton();
         InitializeCamera();
