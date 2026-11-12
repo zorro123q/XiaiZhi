@@ -15,6 +15,13 @@ dependencies:
   78/esp_lcd_nv3023: ~1.0.0
   78/esp-wifi-connect: ~2.6.1
   78/esp-opus-encoder: ~2.4.1
+  # esp-opus-encoder 的公开头文件 opus_encoder.h 里 include 了 "opus.h"，
+  # 但该组件没有把 esp-opus 声明为公开依赖，于是任何用到 opus_encoder.h 的
+  # 组件都拿不到 opus.h 的 include 路径。此前一直靠 ccache 命中蒙混过关，
+  # 只要 main 的编译参数一变（例如新增一个 REQUIRES）就会全量重编，
+  # 立刻报 fatal error: opus.h: No such file or directory。
+  # 这里显式依赖一下，把 include 路径补进 main。
+  78/esp-opus: ~1.0.5
   78/esp-ml307: ~3.3.7
   78/xiaozhi-fonts: ~1.5.2
   espressif/led_strip: ~3.0.1
