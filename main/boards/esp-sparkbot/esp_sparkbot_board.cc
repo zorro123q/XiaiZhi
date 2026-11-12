@@ -479,9 +479,9 @@ private:
         ESP_LOGI(TAG, "巡航速度设为 %d%%", percent);
     }
 
-    // 角度 → 时长 → 原地转。degrees 正数右转、负数左转。
+    // 角度 → 时长 → 原地转。degrees 正数右转、负数左转。返回本次实际时长（ms）。
     // 注意这是开环估计：标定值准不准、电池电压高不高，都会影响实际角度。
-    void StartTurnByDegrees(int degrees) {
+    int StartTurnByDegrees(int degrees) {
         int magnitude = degrees >= 0 ? degrees : -degrees;
         int ms = static_cast<int>(static_cast<long long>(magnitude) * 1000 / turn_deg_per_sec_);
         if (ms > kTurnDurationMaxMs) {
@@ -492,6 +492,7 @@ private:
         }
         StartMotion(degrees > 0 ? 1.0f : -1.0f, 0.0f, ms);
         ESP_LOGI(TAG, "原地转 %d 度 → %dms（标定 %d 度/秒）", degrees, ms, turn_deg_per_sec_);
+        return ms;
     }
 
     // 校准：把实测的"满速原地转一圈用了几秒"换算成度/秒并持久化。
@@ -671,20 +672,36 @@ private:
 
         // 角度入口。整个系统没有角度反馈（无编码器/无 IMU/串口单向），
         // 实际角度 = 标定转速 × 时长，是个开环估计，会随电池电压漂。
+        //
+        // ⚠️ 这个工具是"立即返回"的：MCP 回调跑在 Application 主任务里
+        // （日志 "Send MCP message in main thread" 可证），绝不能在这里阻塞等车转完，
+        // 否则音频、显示、状态机会一起冻结。所以模型拿到响应时车还在转。
+        // 实测踩过的坑：说"转一圈"，模型 0.6 秒就播"转完一圈啦"，而车还要转 3.4 秒。
+        // 对策是把"还没转完"写进返回值里，用返回值约束模型的下一句话。
         mcp_server.AddTool("self.chassis.turn_degrees",
             "原地转动指定角度（转完自动停）。degrees 是角度数值本身，用户说多少就传多少，不做任何换算："
             "“转一圈”传 360，“转半圈”“掉头”传 180，“转四分之一圈”“转 90 度”传 90，“转两圈”传 720；"
-            "正数右转、负数左转。用户只要提到具体角度，或“一圈”“半圈”“掉头”这类量词，一律用这个工具，不要用 turn_left/turn_right",
+            "正数右转、负数左转。用户只要提到具体角度，或“一圈”“半圈”“掉头”这类量词，一律用这个工具，不要用 turn_left/turn_right。"
+            "注意本工具立即返回，车会在后台继续转，返回值里写的持续时间才是它真正停下的时刻",
             PropertyList({
             Property("degrees", kPropertyTypeInteger, 90, -1080, 1080)
         }), [this](const PropertyList& properties) -> ReturnValue {
             int degrees = properties["degrees"].value<int>();
             if (degrees == 0) {
                 StopMotion();
-            } else {
-                StartTurnByDegrees(degrees);
+                return std::string("没有转动，车本来就是停的");
             }
-            return true;
+            int ms = StartTurnByDegrees(degrees);
+            // UTF-8 中文一个字符 3 字节，这句提示约 320 字节，缓冲必须留够，
+            // 否则会在多字节中间截断成乱码
+            char buf[512];
+            snprintf(buf, sizeof(buf),
+                     "已启动原地%s %d 度，车会转 %d 毫秒（约 %d 秒）后自动停。"
+                     "注意：现在是刚开始转，还没转完。回复用户时不要说“转完了”“已经转好”，"
+                     "只能说“正在转”“大约 %d 秒后停下”；要确认结果请稍后调用 get_status",
+                     degrees > 0 ? "右转" : "左转", degrees, ms, (ms + 500) / 1000,
+                     (ms + 500) / 1000);
+            return std::string(buf);
         });
 
         // 校准入口。没有它，turn_degrees 里的标定值就只能靠代码硬编码改固件。
