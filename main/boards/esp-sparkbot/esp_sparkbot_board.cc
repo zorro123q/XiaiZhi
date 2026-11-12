@@ -76,6 +76,20 @@ private:
     static constexpr int kMotionStackSize = 3072;
     static constexpr int kContinuousMaxMs = 60000;  // 无限运动的安全上限：60 秒
 
+    // ── 原地转向标定 ────────────────────────────────────────────────
+    // 整条链路没有任何角度反馈：底盘没有编码器、串口是单向只发不收、
+    // 主控板上也没有 IMU。所以"转一圈"只能靠"转速 × 时间"去逼近。
+    // 转速还随电池电压漂，这是个开环估计，不是闭环测量。
+    // turn_deg_per_sec_ 是唯一能把角度换算成时长的参数，必须实测校准：
+    //   让车满速原地转一整圈，记下用了几秒 → deg_per_sec = 360 / 秒数。
+    // 出厂默认 90°/s（4 秒一圈）纯属估值，实测后务必用
+    // self.chassis.set_turn_calibration 覆盖，值会写进 NVS。
+    int turn_deg_per_sec_ = 90;
+    static constexpr int kTurnDpsMin = 20;          // 18 秒转一圈（很慢的底盘）
+    static constexpr int kTurnDpsMax = 360;         // 1 秒转一圈（很暴力的底盘）
+    static constexpr int kTurnDurationMaxMs = 30000;  // 单次转向时长上限，防呆
+    static constexpr int kTurnDeadbandMs = 100;     // 少于这么多毫秒不值得动电机
+
     // 跳舞灯光联动：底盘是单向串口（只发不收），跳舞何时结束拿不到回执，
     // 只能按固件里写死的动作表时长开一次性定时器，到点由 OnDanceLightTimeout 切休眠。
     //
@@ -310,6 +324,12 @@ private:
         int stored_speed = settings.GetInt("cruise-speed", 100);
         cruise_speed_ = (stored_speed >= 10 && stored_speed <= 100) ? stored_speed : 100;
 
+        // 转向标定从 NVS 恢复（set_turn_calibration 工具会写进去）
+        int stored_dps = settings.GetInt("turn-deg-per-sec", 90);
+        turn_deg_per_sec_ = (stored_dps >= kTurnDpsMin && stored_dps <= kTurnDpsMax) ? stored_dps : 90;
+        ESP_LOGI(TAG, "转向标定：%d 度/秒（一圈约 %d ms）",
+                 turn_deg_per_sec_, 360000 / turn_deg_per_sec_);
+
         // 运动重发任务：负责把"走 N 秒"翻译成持续的 x/y 指令
         motion_mutex_ = xSemaphoreCreateMutex();
         xTaskCreate(MotionTaskEntry, "chassis_motion", kMotionStackSize, this, 5, nullptr);
@@ -427,8 +447,11 @@ private:
         motion_deadline_ = xTaskGetTickCount() + pdMS_TO_TICKS(continuous ? kContinuousMaxMs : duration_ms);
         motion_running_ = true;
         xSemaphoreGive(motion_mutex_);
-        ESP_LOGI(TAG, "底盘运动 x=%d/100 y=%d/100 %s", static_cast<int>(x * 100),
-                 static_cast<int>(y * 100), continuous ? "持续直到停车" : "定时");
+        // 时长必须打出来：模型给的 duration 是它自己猜的，"转不够/走太远"的时候
+        // 只有这个数能证明到底是它给少了，还是车本身跑得慢。
+        ESP_LOGI(TAG, "底盘运动 x=%d/100 y=%d/100 %s %dms", static_cast<int>(x * 100),
+                 static_cast<int>(y * 100), continuous ? "持续直到停车" : "定时",
+                 continuous ? kContinuousMaxMs : duration_ms);
     }
 
     // 调速度：存 NVS，正在走的话同步改当前速度（原地转向时不改，免得突然窜出去）
@@ -454,6 +477,43 @@ private:
         }
         xSemaphoreGive(motion_mutex_);
         ESP_LOGI(TAG, "巡航速度设为 %d%%", percent);
+    }
+
+    // 角度 → 时长 → 原地转。degrees 正数右转、负数左转。
+    // 注意这是开环估计：标定值准不准、电池电压高不高，都会影响实际角度。
+    void StartTurnByDegrees(int degrees) {
+        int magnitude = degrees >= 0 ? degrees : -degrees;
+        int ms = static_cast<int>(static_cast<long long>(magnitude) * 1000 / turn_deg_per_sec_);
+        if (ms > kTurnDurationMaxMs) {
+            ms = kTurnDurationMaxMs;
+        }
+        if (ms < kTurnDeadbandMs) {
+            ms = kTurnDeadbandMs;
+        }
+        StartMotion(degrees > 0 ? 1.0f : -1.0f, 0.0f, ms);
+        ESP_LOGI(TAG, "原地转 %d 度 → %dms（标定 %d 度/秒）", degrees, ms, turn_deg_per_sec_);
+    }
+
+    // 校准：把实测的"满速原地转一圈用了几秒"换算成度/秒并持久化。
+    // 这是让"转一圈"真的变成一圈的唯一入口，不要把标定值硬编码在代码里。
+    int SetTurnCalibration(int seconds_per_rev) {
+        if (seconds_per_rev < 1) {
+            seconds_per_rev = 1;
+        } else if (seconds_per_rev > 18) {
+            seconds_per_rev = 18;
+        }
+        int dps = 360 / seconds_per_rev;
+        if (dps < kTurnDpsMin) {
+            dps = kTurnDpsMin;
+        } else if (dps > kTurnDpsMax) {
+            dps = kTurnDpsMax;
+        }
+        turn_deg_per_sec_ = dps;
+
+        Settings settings("sparkbot", true);
+        settings.SetInt("turn-deg-per-sec", dps);
+        ESP_LOGI(TAG, "转向标定：%d 秒/圈 → %d 度/秒", seconds_per_rev, dps);
+        return dps;
     }
 
     std::string GetMotionStatusJson() {
@@ -573,7 +633,7 @@ private:
             Property("duration", kPropertyTypeInteger, 2, 1, 10)
         });
 
-        mcp_server.AddTool("self.chassis.move", "让小车一直按指定速度走，直到调用停车工具或 60 秒上限。speed 正数前进、负数后退；turn 正数右转、负数左转；都是 -100~100 的百分比。用户说“一直往前走”“继续走”“开快点”时用这个", PropertyList({
+        mcp_server.AddTool("self.chassis.move", "让小车一直按指定速度走，直到调用停车工具或 60 秒上限。speed 正数前进、负数后退；turn 正数右转、负数左转；都是 -100~100 的百分比。用户说“一直往前走”“继续走”“开快点”时用这个。用户给了具体角度（转多少度、转一圈）时必须用 turn_degrees，不要拿 turn 参数去凑角度", PropertyList({
             Property("speed", kPropertyTypeInteger, 100, -100, 100),
             Property("turn", kPropertyTypeInteger, 0, -100, 100)
         }), [this](const PropertyList& properties) -> ReturnValue {
@@ -597,15 +657,57 @@ private:
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.turn_left", "原地左转一小段（转完自动停）。duration 为持续秒数（1-10），越大转得越多", motion_args, [this](const PropertyList& properties) -> ReturnValue {
+        // 兜底的"随便转一下"。用户给了具体角度时应该走 turn_degrees，
+        // 那里才有时长按角度换算；这里只能靠 duration 猜，所以描述里明确分流。
+        mcp_server.AddTool("self.chassis.turn_left", "原地左转一小段（转完自动停）。duration 为持续秒数（1-10），越大转得越多。仅当用户没说角度、只想随便转一下时用；用户说了角度或“一圈”“半圈”请用 turn_degrees", motion_args, [this](const PropertyList& properties) -> ReturnValue {
             StartMotion(-1.0f, 0.0f, properties["duration"].value<int>() * 1000);
             return true;
         });
 
-        mcp_server.AddTool("self.chassis.turn_right", "原地右转一小段（转完自动停）。duration 为持续秒数（1-10），越大转得越多", motion_args, [this](const PropertyList& properties) -> ReturnValue {
+        mcp_server.AddTool("self.chassis.turn_right", "原地右转一小段（转完自动停）。duration 为持续秒数（1-10），越大转得越多。仅当用户没说角度、只想随便转一下时用；用户说了角度或“一圈”“半圈”请用 turn_degrees", motion_args, [this](const PropertyList& properties) -> ReturnValue {
             StartMotion(1.0f, 0.0f, properties["duration"].value<int>() * 1000);
             return true;
         });
+
+        // 角度入口。整个系统没有角度反馈（无编码器/无 IMU/串口单向），
+        // 实际角度 = 标定转速 × 时长，是个开环估计，会随电池电压漂。
+        mcp_server.AddTool("self.chassis.turn_degrees",
+            "原地转动指定角度（转完自动停）。degrees 是角度数值本身，用户说多少就传多少，不做任何换算："
+            "“转一圈”传 360，“转半圈”“掉头”传 180，“转四分之一圈”“转 90 度”传 90，“转两圈”传 720；"
+            "正数右转、负数左转。用户只要提到具体角度，或“一圈”“半圈”“掉头”这类量词，一律用这个工具，不要用 turn_left/turn_right",
+            PropertyList({
+            Property("degrees", kPropertyTypeInteger, 90, -1080, 1080)
+        }), [this](const PropertyList& properties) -> ReturnValue {
+            int degrees = properties["degrees"].value<int>();
+            if (degrees == 0) {
+                StopMotion();
+            } else {
+                StartTurnByDegrees(degrees);
+            }
+            return true;
+        });
+
+        // 校准入口。没有它，turn_degrees 里的标定值就只能靠代码硬编码改固件。
+        mcp_server.AddTool("self.chassis.set_turn_calibration",
+            "校准原地转向速度。seconds_per_rev = 让车满速原地转一整圈实际用了几秒（1-18 的整数，取最接近的整秒）。"
+            "只有在用户配合实测（看着车转完一圈并计时），或者用户反馈“转的角度不准”时才调用；"
+            "不要自己估一个值随便调。会存进 NVS，重启后仍然有效",
+            PropertyList({
+            Property("seconds_per_rev", kPropertyTypeInteger, 4, 1, 18)
+        }), [this](const PropertyList& properties) -> ReturnValue {
+            int sec = properties["seconds_per_rev"].value<int>();
+            int dps = SetTurnCalibration(sec);
+            return std::string("已校准：一圈 ") + std::to_string(sec) + " 秒，" +
+                   std::to_string(dps) + " 度/秒";
+        });
+
+        // 让模型能读回标定值，否则"校准过了没有"它自己都不知道
+        mcp_server.AddTool("self.chassis.get_turn_calibration",
+            "获取当前的原地转向标定值，返回“度/秒”和推算的“一圈多少毫秒”。用户问“现在转一圈要多久”时用它",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                return std::string("{\"deg_per_sec\":") + std::to_string(turn_deg_per_sec_) +
+                       ",\"ms_per_rev\":" + std::to_string(360000 / turn_deg_per_sec_) + "}";
+            });
 
         mcp_server.AddTool("self.chassis.stop", "立即停止底盘运动", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
             StopMotion();
