@@ -25,18 +25,24 @@
 #define VOLUME_DOWN_BUTTON_GPIO GPIO_NUM_NC
 
 /*
-    顶部触摸键（双击打断）
-    机头的触摸片是 FPC 贴在结构件上的，被摄像头挤成了左右两块、串接在同一个引脚上，
-    对应 TOUCH_PAD_NUM1 —— ESP32-S3 上就是 GPIO1。本固件里 GPIO1/2/3 全部空闲
+    触摸键（双击打断）
+    机头的触摸片是 FPC 贴在结构件上的，被摄像头挤成了左右两块、串接在同一个引脚上；
+    左右两侧面还各有一个。官方 BSP 用 TOUCH_PAD_NUM1/2/3 三路，
+    ESP32-S3 上分别对应 GPIO1/2/3，本固件里这三个脚全部空闲
     （I2S 占 39-42、I2C 占 4/5、SPI 占 21/43/44/47、UART 占 38/48、PA 占 46、
     ADC 占 14、摄像头占 6-18），所以不冲突。
-    左右侧面还各有一个键（NUM2/NUM3），本固件暂不接管。
-    灵敏度沿用官方 BSP 的取值：顶部两块并联面积大，用 0.04 压低防误触。
+
+    ⚠️ 哪一路是"顶部"没有文档写明，只能靠串口日志实测：
+    双击顶部，看打印出来的 Touch[n] 是几，然后把 TOUCH_PRIMARY_INDEX 改成那个 n。
+    默认先按官方 README 的说法猜 0（NUM1/GPIO1 = 顶部确认键）。
 */
-#define TOUCH_TOP_SENSITIVITY   0.04F
+#define TOUCH_SENS_TOP         0.04F   // 顶部两块 FPC 并联、面积大，灵敏度压低防误触
+#define TOUCH_SENS_SIDE        0.1F    // 左右侧面，沿用官方 BSP 取值
+#define TOUCH_PRIMARY_INDEX    0       // 0=NUM1/GPIO1, 1=NUM2/GPIO2, 2=NUM3/GPIO3
+
 // 两次"按下"的最大间隔，超过就当成两次独立的按下。
-// 太小按不出来，太大容易把两次无意的触碰判成双击。
-#define TOUCH_DOUBLE_CLICK_MS   350
+// 350 对多数人偏紧（第二次按下常在 300~450ms），放宽到 500 提高成功率。
+#define TOUCH_DOUBLE_CLICK_MS   500
 
 #define DISPLAY_WIDTH   240
 #define DISPLAY_HEIGHT  240

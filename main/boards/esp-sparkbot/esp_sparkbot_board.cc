@@ -56,8 +56,8 @@ class EspSparkBot : public WifiBoard {
 private:
     i2c_master_bus_handle_t i2c_bus_;
     Button boot_button_;
-    // 顶部触摸键：双击 = 打断当前播报并立刻继续聆听
-    touch_button_handle_t touch_top_ = nullptr;
+    // 触摸键：三路通道全注册，用于实测确认哪一路是顶部
+    touch_button_handle_t touch_handles_[3] = { nullptr, nullptr, nullptr };
     uint32_t touch_last_press_ms_ = 0;
     Display* display_;
     Esp32Camera* camera_;
@@ -181,28 +181,54 @@ private:
 #endif
     }
 
-    // touch_element 的回调是 C 函数指针，用订阅时塞的 arg 把 this 带回来
-    static void TouchTopCallback(touch_button_handle_t handle, touch_button_message_t* message, void* arg) {
-        (void)handle;  // 只挂了一个键，用不上句柄
-        auto self = static_cast<EspSparkBot*>(arg);
-        if (self != nullptr && message != nullptr) {
-            self->OnTouchTopEvent(message);
+    /*
+        触摸键 —— 诊断版：三路通道全部注册，每次事件都打日志。
+
+        为什么这么干：官方文档没说 NUM1/2/3 哪一路是"顶部"，之前的版本写死
+        NUM1 双击没反应，既可能是通道选错、也可能是双击窗口太短、还可能是
+        触摸硬件压根没接。三路全注册 + 每次 PRESS 都打日志，烧一次就能把
+        这三种情况区分开：
+          · 完全没日志        → 触摸驱动没起来或硬件没接
+          · 按顶部打出 Touch[1] 或 Touch[2] → 通道选错，改 TOUCH_PRIMARY_INDEX
+          · 打出 Touch[0] 但没打断 → 看 state=? 那行，是状态不对还是窗口问题
+    */
+    static const char* TouchName(int idx) {
+        switch (idx) {
+            case 0:  return "NUM1/GPIO1";
+            case 1:  return "NUM2/GPIO2";
+            default: return "NUM3/GPIO3";
         }
     }
 
-    /*
-        只认双击，单击故意不做任何事。
-        理由：只要注册了"单击要等双击窗口结束才生效"这套逻辑，单击必然带
-        TOUCH_DOUBLE_CLICK_MS 的延迟；而这 3 个触摸键在本固件里原本一个都没
-        接过功能，不做单击等于零代价，还省掉了"这一下到底是单击还是双击"
-        的二选一状态机。
-    */
-    void OnTouchTopEvent(touch_button_message_t* message) {
+    static void TouchCallback0(touch_button_handle_t handle, touch_button_message_t* message, void* arg) {
+        (void)handle;
+        static_cast<EspSparkBot*>(arg)->OnTouchEvent(0, message);
+    }
+    static void TouchCallback1(touch_button_handle_t handle, touch_button_message_t* message, void* arg) {
+        (void)handle;
+        static_cast<EspSparkBot*>(arg)->OnTouchEvent(1, message);
+    }
+    static void TouchCallback2(touch_button_handle_t handle, touch_button_message_t* message, void* arg) {
+        (void)handle;
+        static_cast<EspSparkBot*>(arg)->OnTouchEvent(2, message);
+    }
+
+    void OnTouchEvent(int idx, touch_button_message_t* message) {
+        if (message == nullptr) {
+            return;
+        }
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        ESP_LOGI(TAG, "Touch[%d] %s event=%d t=%lu", idx, TouchName(idx),
+                 static_cast<int>(message->event), static_cast<unsigned long>(now_ms));
+
         if (message->event != TOUCH_BUTTON_EVT_ON_PRESS) {
             return;
         }
+        // 双击打断只绑 TOUCH_PRIMARY_INDEX 这一路，其余通道只打日志不动作
+        if (idx != TOUCH_PRIMARY_INDEX) {
+            return;
+        }
 
-        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
         bool is_double_click = (touch_last_press_ms_ != 0) &&
                                (now_ms - touch_last_press_ms_ < TOUCH_DOUBLE_CLICK_MS);
         if (!is_double_click) {
@@ -222,7 +248,7 @@ private:
         ESP_LOGI(TAG, "Touch double-click: abort speaking, keep listening");
         // StartListening() 在 Speaking 状态下就是 AbortSpeaking + 切手动聆听模式，
         // 正好是"打断并立刻能接着说话"。它内部走 Schedule() 投递到主任务，
-        // 所以在触摸任务上下文里调用是安全的，不会阻塞事件循环。
+        // 所以在触摸回调上下文里调用是安全的，不会阻塞事件循环。
         app.StartListening();
     }
 
@@ -233,21 +259,31 @@ private:
         touch_button_global_config_t button_global_config = TOUCH_BUTTON_GLOBAL_DEFAULT_CONFIG();
         ESP_ERROR_CHECK(touch_button_install(&button_global_config));
 
-        touch_button_config_t button_config = {
-            .channel_num = TOUCH_PAD_NUM1,
-            .channel_sens = TOUCH_TOP_SENSITIVITY
-        };
-        ESP_ERROR_CHECK(touch_button_create(&button_config, &touch_top_));
-        ESP_ERROR_CHECK(touch_button_subscribe_event(touch_top_,
-                                                     TOUCH_ELEM_EVENT_ON_PRESS,
-                                                     static_cast<void*>(this)));
-        ESP_ERROR_CHECK(touch_button_set_dispatch_method(touch_top_, TOUCH_ELEM_DISP_CALLBACK));
-        ESP_ERROR_CHECK(touch_button_set_callback(touch_top_, TouchTopCallback));
-        // 长按阈值放到 3 秒：双击之后手指还搭在上面时，不要被识别成长按之类
-        ESP_ERROR_CHECK(touch_button_set_longpress(touch_top_, 3000));
+        const touch_pad_t channels[3] = { TOUCH_PAD_NUM1, TOUCH_PAD_NUM2, TOUCH_PAD_NUM3 };
+        const float sens[3] = { TOUCH_SENS_TOP, TOUCH_SENS_SIDE, TOUCH_SENS_SIDE };
+        touch_button_callback_t callbacks[3] = { TouchCallback0, TouchCallback1, TouchCallback2 };
+
+        for (int i = 0; i < 3; i++) {
+            touch_button_config_t cfg = {
+                .channel_num = channels[i],
+                .channel_sens = sens[i]
+            };
+            ESP_ERROR_CHECK(touch_button_create(&cfg, &touch_handles_[i]));
+            // PRESS 和 RELEASE 都订：只订 PRESS 时按钮状态机可能走不完整，
+            // 双击的第二下容易被吞
+            ESP_ERROR_CHECK(touch_button_subscribe_event(touch_handles_[i],
+                                                         TOUCH_ELEM_EVENT_ON_PRESS | TOUCH_ELEM_EVENT_ON_RELEASE,
+                                                         static_cast<void*>(this)));
+            ESP_ERROR_CHECK(touch_button_set_dispatch_method(touch_handles_[i], TOUCH_ELEM_DISP_CALLBACK));
+            ESP_ERROR_CHECK(touch_button_set_callback(touch_handles_[i], callbacks[i]));
+            // 长按阈值 3 秒：双击之后手指还搭在上面时，不要被识别成长按之类
+            ESP_ERROR_CHECK(touch_button_set_longpress(touch_handles_[i], 3000));
+        }
         ESP_ERROR_CHECK(touch_element_start());
 
-        ESP_LOGI(TAG, "Top touch button ready (double-click to interrupt)");
+        ESP_LOGI(TAG, "Touch ready: [0]=%s [1]=%s [2]=%s, double-click on [%d] interrupts",
+                 TouchName(0), TouchName(1), TouchName(2), TOUCH_PRIMARY_INDEX);
+        ESP_LOGI(TAG, "Tap the TOP pad and check the 'Touch[n]' log to confirm which index it is");
     }
 
     void InitializeDisplay() {
