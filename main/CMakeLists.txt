@@ -307,26 +307,6 @@ endif()
 idf_component_register(SRCS ${SOURCES}
                     EMBED_FILES ${LANG_SOUNDS} ${COMMON_SOUNDS}
                     INCLUDE_DIRS ${INCLUDE_DIRS}
-                    # 这个文件以前完全没写 REQUIRES，main 能编过全靠 IDF 的
-                    # "common requirements"（cxx/newlib/freertos/heap/log/soc/hal/
-                    # esp_rom/esp_common/esp_system/esp_hw_support…）加上 managed
-                    # component 的传递依赖。平时没事，因为 ccache 一直命中旧缓存，
-                    # 从没真正重编过整包。一旦编译参数变化触发全量重编，就会接连
-                    # 冒出 "xxx.h: No such file or directory"。
-                    # 下面这些是 main 里真实用到、但既不在 common requirements、
-                    # 也没被任何 managed component 公开传递过来的组件：
-                    #   esp_psram      -> display/lcd_display.cc  <esp_psram.h>
-                    #   spi_flash      -> system_info.cc          <esp_flash.h>
-                    #   efuse          -> ota.cc                  <esp_efuse.h>
-                    #   esp_app_format -> mcp_server.cc/system_info.cc <esp_app_desc.h>
-                    #   app_update     -> ota.cc                  <esp_ota_ops.h>
-                    # touch_element 则是本次新增的触摸键要用。
-                    PRIV_REQUIRES touch_element
-                                  esp_psram
-                                  spi_flash
-                                  efuse
-                                  esp_app_format
-                                  app_update
                     WHOLE_ARCHIVE
                     )
 
