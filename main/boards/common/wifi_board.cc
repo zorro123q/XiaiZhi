@@ -100,6 +100,13 @@ void WifiBoard::StartNetwork() {
         auto display = Board::GetInstance().GetDisplay();
         std::string notification = Lang::Strings::CONNECTED_TO;
         notification += ssid;
+        // 局域网直连（手机浏览器访问设备）需要知道 IP，连上就顺手显示出来。
+        // 这个回调在 IP_EVENT_STA_GOT_IP 之后触发，GetIpAddress() 已经有值。
+        auto ip = WifiStation::GetInstance().GetIpAddress();
+        if (!ip.empty()) {
+            notification += "\n";
+            notification += ip;
+        }
         display->ShowNotification(notification.c_str(), 30000);
     });
     wifi_station.Start();

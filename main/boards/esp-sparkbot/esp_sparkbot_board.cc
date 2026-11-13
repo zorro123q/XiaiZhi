@@ -948,6 +948,26 @@ private:
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
                 return cubetoy::GetProbeSummary();
             });
+
+        // ── 局域网遥控地址 ──────────────────────────────────────────
+        // 手机遥控有两条路：连 SparkBot-Car 热点（192.168.4.1:8080），
+        // 或者手机和车连同一个路由器、直接访问车的 IP:8080。
+        // 后者更快（不占 AP 射频），但 IP 是 DHCP 分配、还会变，所以让用户问一句。
+        mcp_server.AddTool("self.network.get_ip",
+            "查询设备在局域网里的 IP 地址，以及手机遥控网页的访问地址（遥控页在 8080 端口）。"
+            "用户问“你的 IP 是多少”“怎么用手机遥控”“遥控网页在哪”“网页打不开”时调用",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                auto& wifi = WifiStation::GetInstance();
+                auto ip = wifi.GetIpAddress();
+                if (ip.empty()) {
+                    return std::string("设备还没连上路由器，没有局域网地址。"
+                                       "手机可以连 SparkBot-Car 热点（密码 12345678），"
+                                       "然后打开 http://192.168.4.1:8080");
+                }
+                return std::string("{\"ssid\":\"") + wifi.GetSsid() +
+                       "\",\"ip\":\"" + ip +
+                       "\",\"remote\":\"http://" + ip + ":8080\"}";
+            });
     }
 
 public:

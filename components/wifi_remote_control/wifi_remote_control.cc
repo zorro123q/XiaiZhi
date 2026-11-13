@@ -38,6 +38,16 @@ static WifiRemoteControl::CaptureJpegFn s_capture_jpeg;
 static WifiRemoteControl::BatteryFn s_read_battery;
 static int64_t s_last_battery_send = 0;
 
+// 遥控热点与 HTTP 服务
+//
+// 端口选 8080 而不是 80，是因为配网组件 WifiConfigurationAp 固定占用 80 端口
+// （http://192.168.4.1）。两边都在 WIFI_AP_DEF 上，如果撞端口，配网页会
+// httpd_start 失败——那就把用户彻底锁在配网外面了。分开端口后两者可以共存：
+// 配网页走 80，遥控页走 8080，谁都不影响谁。
+static constexpr const char* kApSsid = "SparkBot-Car";
+static constexpr const char* kApPass = "12345678";
+static constexpr int kHttpPort = 8080;
+
 // ---------------------------------------------------------------------------
 // 手机遥控页面（全屏摇杆，适配触屏）
 // ---------------------------------------------------------------------------
@@ -297,8 +307,9 @@ static void stream_task(void*) {
 static void start_httpd() {
     if (s_server != nullptr) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
-    cfg.server_port = 80;
-    cfg.max_open_sockets = 3;
+    cfg.server_port = kHttpPort;
+    // 一个页面 + 一条 WebSocket 视频流就占两个；留出余量给第二台手机或临时重连
+    cfg.max_open_sockets = 5;
     cfg.lru_purge_enable = true;
     cfg.send_wait_timeout = 1;
     cfg.recv_wait_timeout = 1;
@@ -324,75 +335,113 @@ static void start_httpd() {
         ESP_LOGE(TAG, "register remote handlers failed");
         return;
     }
-    s_stream_running.store(true);
-    s_stream_active.store(true);
-    // 栈要够 frame2jpg 编码用：4K 偏紧，编码偶发栈溢出会直接把设备打重启
-    if (xTaskCreate(stream_task, "ws_camera", 8192, nullptr, 3, nullptr) != pdPASS) {
-        s_stream_active.store(false);
-        s_stream_running.store(false);
-        httpd_stop(s_server);
-        s_server = nullptr;
-        ESP_LOGE(TAG, "create camera task failed");
-        return;
+    // 看守任务可能会重复拉起 httpd，取帧任务只能有一份，否则两个任务
+    // 同时抓帧会双倍占 CPU/PSRAM
+    if (!s_stream_running.load()) {
+        s_stream_running.store(true);
+        s_stream_active.store(true);
+        // 栈要够 frame2jpg 编码用：4K 偏紧，编码偶发栈溢出会直接把设备打重启
+        if (xTaskCreate(stream_task, "ws_camera", 8192, nullptr, 3, nullptr) != pdPASS) {
+            s_stream_active.store(false);
+            s_stream_running.store(false);
+            httpd_stop(s_server);
+            s_server = nullptr;
+            ESP_LOGE(TAG, "create camera task failed");
+            return;
+        }
     }
-    ESP_LOGI(TAG, "WebSocket remote ready on port 80 /ws");
+    ESP_LOGI(TAG, "WebSocket remote ready on port %d /ws", kHttpPort);
 }
 
 // ---------------------------------------------------------------------------
-// 开热点（延迟启动，避免和 STA 抢信道）
+// 遥控热点（常驻看守）
+//
+// 旧实现的两个毛病：
+//   1) 固定等 6 秒后**一次性**检查 STA，没连上就直接放弃、永不重试。
+//      开机连接慢于 6 秒（扫描 + 关联 + DHCP）时，热点就整个消失了。
+//   2) 判据是"STA 已连接"，等于"没网时反而不给热点"——而没网（没有路由器、
+//      在外面、路由器改了密码）恰恰是最需要手机直连遥控的时候。
+//
+// 现在改成常驻看守：只要 AP 没被配网组件占用，就保证 SparkBot-Car 存在；
+// 它与是否连上路由器无关。AP 被改名成 Xiaozhi-XXXX 时不抢（那是配网页的
+// 热点），但 HTTP 服务在 8080 上继续可用。
 // ---------------------------------------------------------------------------
-static void ap_task(void* arg) {
-    vTaskDelay(pdMS_TO_TICKS(6000));  // 等 WiFi 状态稳定
 
-    // 1) 只在 STA 已连接时启用。设备处于配网模式时，WifiConfigurationAp 已经创建了
-    //    WIFI_AP_DEF 和 80 端口服务器，这里再创建会触发 assert（duplicate key）→ 重启。
-    wifi_ap_record_t sta_info;
-    if (esp_wifi_sta_get_ap_info(&sta_info) != ESP_OK) {
-        ESP_LOGW(TAG, "STA 未连接（可能处于配网模式），跳过遥控热点");
-        vTaskDelete(nullptr);
-        return;
+static bool sta_connected() {
+    wifi_ap_record_t info;
+    return esp_wifi_sta_get_ap_info(&info) == ESP_OK;
+}
+
+// SoftAP 的 SSID 已经不是我们设的 → 配网组件接管了 WIFI_AP_DEF
+static bool ap_owned_by_others() {
+    wifi_config_t cfg = {};
+    if (esp_wifi_get_config(WIFI_IF_AP, &cfg) != ESP_OK) {
+        return false;
     }
+    const char* current = reinterpret_cast<const char*>(cfg.ap.ssid);
+    if (current[0] == '\0') {
+        return false;  // 还没人设置过
+    }
+    return strcmp(current, kApSsid) != 0;
+}
 
-    // 2) 复用已有 AP netif，不要重复创建
+static bool bring_up_remote_ap() {
+    // 复用已有 AP netif，不要重复创建（配网组件可能已经建过一个）
     esp_netif_t* ap_netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (ap_netif == nullptr) {
         ap_netif = esp_netif_create_default_wifi_ap();
     }
     if (ap_netif == nullptr) {
         ESP_LOGE(TAG, "无法获取 AP netif，放弃遥控热点");
-        vTaskDelete(nullptr);
-        return;
+        return false;
     }
 
-    // 3) 切 APSTA，保留原有的 STA 连接
+    // APSTA：保留 STA 那边已有的连接或重连流程，同时把 AP 挂上
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "set WIFI_MODE_APSTA failed: %s", esp_err_to_name(err));
-        vTaskDelete(nullptr);
-        return;
+        return false;
     }
 
     wifi_config_t ap_cfg = {};
-    const char* ssid = "SparkBot-Car";
-    const char* pass = "12345678";
-    strncpy(reinterpret_cast<char*>(ap_cfg.ap.ssid), ssid, sizeof(ap_cfg.ap.ssid));
-    strncpy(reinterpret_cast<char*>(ap_cfg.ap.password), pass, sizeof(ap_cfg.ap.password));
-    ap_cfg.ap.ssid_len = strlen(ssid);
-    ap_cfg.ap.channel = 0;  // 0 = 跟随 STA 当前信道
+    strncpy(reinterpret_cast<char*>(ap_cfg.ap.ssid), kApSsid, sizeof(ap_cfg.ap.ssid));
+    strncpy(reinterpret_cast<char*>(ap_cfg.ap.password), kApPass, sizeof(ap_cfg.ap.password));
+    ap_cfg.ap.ssid_len = strlen(kApSsid);
+    // 连上路由器时跟随 STA 信道，手机少切一次；没连时信道未知，固定到 6
+    ap_cfg.ap.channel = sta_connected() ? 0 : 6;
     ap_cfg.ap.max_connection = 4;
     ap_cfg.ap.authmode = WIFI_AUTH_WPA2_PSK;
 
     err = esp_wifi_set_config(WIFI_IF_AP, &ap_cfg);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "set AP config failed: %s", esp_err_to_name(err));
-        vTaskDelete(nullptr);
-        return;
+        return false;
     }
-    ESP_LOGI(TAG, "AP configured: ssid=%s pass=%s", ssid, pass);
+    ESP_LOGI(TAG, "AP configured: ssid=%s pass=%s", kApSsid, kApPass);
 
     start_httpd();
-    ESP_LOGI(TAG, "phone -> wifi '%s' / '%s' -> http://192.168.4.1", ssid, pass);
-    vTaskDelete(nullptr);
+    if (s_server == nullptr) {
+        return false;
+    }
+    ESP_LOGI(TAG, "phone -> wifi '%s' / '%s' -> http://192.168.4.1:%d (STA %s)",
+             kApSsid, kApPass, kHttpPort, sta_connected() ? "connected" : "disconnected");
+    return true;
+}
+
+static void remote_watch_task(void*) {
+    vTaskDelay(pdMS_TO_TICKS(6000));  // 先让 WiFi 状态机跑起来，别和 STA 抢
+
+    while (true) {
+        if (ap_owned_by_others()) {
+            // 配网模式：热点名归配网组件，不去覆盖；只把 8080 上的遥控服务拉起来
+            if (s_server == nullptr) {
+                start_httpd();
+            }
+        } else if (s_server == nullptr) {
+            bring_up_remote_ap();
+        }
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 }
 
 bool WifiRemoteControl::Start(std::function<void(const std::string&)> send_cmd,
@@ -401,9 +450,9 @@ bool WifiRemoteControl::Start(std::function<void(const std::string&)> send_cmd,
     s_send = std::move(send_cmd);
     s_capture_jpeg = std::move(capture_jpeg);
     s_read_battery = std::move(read_battery);
-    BaseType_t ok = xTaskCreate(ap_task, "wifi_remote", 4096, nullptr, 3, nullptr);
+    BaseType_t ok = xTaskCreate(remote_watch_task, "wifi_remote", 4096, nullptr, 3, nullptr);
     if (ok != pdPASS) {
-        ESP_LOGE(TAG, "create ap_task failed");
+        ESP_LOGE(TAG, "create remote watch task failed");
         return false;
     }
     return true;
