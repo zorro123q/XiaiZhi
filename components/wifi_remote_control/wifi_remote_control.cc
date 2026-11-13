@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <atomic>
 #include <cmath>
 #include <new>
@@ -308,6 +309,10 @@ static void start_httpd() {
     if (s_server != nullptr) return;
     httpd_config_t cfg = HTTPD_DEFAULT_CONFIG();
     cfg.server_port = kHttpPort;
+    // 默认 ctrl_port 是 32768（UDP）。实测在纯 STA 启动早期绑这个端口会报
+    // EADDRINUSE(112)，httpd 直接起不来——虽然 server socket(8080/TCP) 已绑成功。
+    // 显式指定成 8081，跟 server_port 挨着，避免撞到 lwip 的临时端口池。
+    cfg.ctrl_port = kHttpPort + 1;
     // 一个页面 + 一条 WebSocket 视频流就占两个；留出余量给第二台手机或临时重连
     cfg.max_open_sockets = 5;
     cfg.lru_purge_enable = true;
@@ -315,7 +320,7 @@ static void start_httpd() {
     cfg.recv_wait_timeout = 1;
     cfg.close_fn = close_client;
     if (httpd_start(&s_server, &cfg) != ESP_OK) {
-        ESP_LOGE(TAG, "httpd_start failed");
+        ESP_LOGE(TAG, "httpd_start failed (port %d/ctrl %d): %s", kHttpPort, cfg.ctrl_port, strerror(errno));
         s_server = nullptr;
         return;
     }
@@ -372,17 +377,25 @@ static bool sta_connected() {
     return esp_wifi_sta_get_ap_info(&info) == ESP_OK;
 }
 
-// SoftAP 的 SSID 已经不是我们设的 → 配网组件接管了 WIFI_AP_DEF
+// 本次运行里 AP netif 是不是我们自己建的。
+// 不能用 esp_wifi_get_config(WIFI_IF_AP) 的 SSID 直接判断"配网有没有在跑"：
+// WiFi 驱动会把 AP 配置存进 NVS，重启后哪怕配网早就结束了，读出来仍是
+// 上次的 "Xiaozhi-XXXX" —— 据此判断会把我们自己挡在门外（实测踩过）。
+// AP netif 是运行期对象，不会跨重启存活，用它判断才准。
+static bool s_ap_netif_ours = false;
+
 static bool ap_owned_by_others() {
+    if (!s_ap_netif_ours) {
+        // 我们还没建过 AP netif：它却已经存在 → 配网组件建的，让给它
+        return esp_netif_get_handle_from_ifkey("WIFI_AP_DEF") != nullptr;
+    }
+    // 我们的 netif 还在，但 SSID 被改成了别的名字 → 配网接管了
     wifi_config_t cfg = {};
     if (esp_wifi_get_config(WIFI_IF_AP, &cfg) != ESP_OK) {
         return false;
     }
     const char* current = reinterpret_cast<const char*>(cfg.ap.ssid);
-    if (current[0] == '\0') {
-        return false;  // 还没人设置过
-    }
-    return strcmp(current, kApSsid) != 0;
+    return current[0] != '\0' && strcmp(current, kApSsid) != 0;
 }
 
 static bool bring_up_remote_ap() {
@@ -395,6 +408,7 @@ static bool bring_up_remote_ap() {
         ESP_LOGE(TAG, "无法获取 AP netif，放弃遥控热点");
         return false;
     }
+    s_ap_netif_ours = true;
 
     // APSTA：保留 STA 那边已有的连接或重连流程，同时把 AP 挂上
     esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
