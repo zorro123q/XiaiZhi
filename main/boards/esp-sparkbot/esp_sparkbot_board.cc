@@ -158,6 +158,18 @@ private:
             if (app.GetDeviceState() == kDeviceStateStarting && !WifiStation::GetInstance().IsConnected()) {
                 ResetWifiConfiguration();
             }
+            // 跟随中按 BOOT = 一键退出跟随，不切对话状态。
+            // 用户需要一个不依赖语音识别的物理出口：跟错目标、或者语音没听清的时候，
+            // 伸手按一下就能让车停下、摄像头预览收起。
+            if (vfollow::IsRunning()) {
+                StopMotion();
+                vfollow::Stop();
+                if (camera_ != nullptr) {
+                    camera_->HidePreview();
+                }
+                ESP_LOGI(TAG, "BOOT 按下，已退出视觉跟随");
+                return;
+            }
             app.ToggleChatState();
         });
 
@@ -990,7 +1002,14 @@ private:
             bool ok = vfollow::Start(cfg,
                 [this](float x, float y) { ApplyFollowMotion(x, y); },
                 [this]() { OnFollowTaskExit(); },
-                [this]() { camera_->CommitPreview(); });
+                [this]() {
+                    // 双重保险：写入权一旦被收回（喊停、摇杆接管、别的运动指令），
+                    // 立刻停止刷预览。不然任务还在取帧的那一秒里，屏幕会继续动，
+                    // 用户会以为"说了结束还在拍"。
+                    if (follow_owns_motion_.load() && camera_ != nullptr) {
+                        camera_->CommitPreview();
+                    }
+                });
             if (!ok) {
                 return std::string("启动失败：上一轮跟随还在收尾，或者任务创建不出来，过一秒再试");
             }
@@ -1005,17 +1024,22 @@ private:
         });
 
         mcp_server.AddTool("self.follow.stop",
-            "停止视觉跟随并让车停住。用户说别跟了、停下、停一停、够了的时候调用",
+            "结束视觉跟随：停车、关掉摄像头预览、退出跟随模式。"
+            "用户说别跟了、停下、停一停、够了、结束任务、结束跟随、关闭跟随、退出跟随时都调用这个",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-            if (!vfollow::IsRunning()) {
-                StopMotion();
-                return std::string("当前没有在跟随，车是停着的");
-            }
-            // 先停车再请求停止：StopMotion 会立刻清掉写入权，车当场停住，
-            // 不用等跟随任务从取帧里退出来（那最长要一秒）。
+            const bool was_running = vfollow::IsRunning();
+            // StopMotion 会立刻清掉底盘写入权（车当场停住），并顺带通知跟随任务退出。
             StopMotion();
             vfollow::Stop();
-            return std::string("已停止跟随，车停住了");
+            // 预览必须在这里立刻收：跟随任务可能正卡在取帧里最长一秒，
+            // 用户说了"结束"却还看见画面在动，会以为根本没关掉。
+            if (camera_ != nullptr) {
+                camera_->HidePreview();
+            }
+            if (!was_running) {
+                return std::string("当前没有在跟随，车是停着的，摄像头预览也关掉了");
+            }
+            return std::string("已结束跟随：车停住，摄像头预览关闭");
         });
 
         mcp_server.AddTool("self.follow.get_status",

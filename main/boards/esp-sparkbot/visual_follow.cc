@@ -27,10 +27,16 @@ constexpr int kCell = kFrameW / kGrid;  // 15 像素一格
 // 够罩住一个占到 19% 画面的球。
 constexpr int kNeighbor = 3;
 
-constexpr int kMinPixels = 45;          // 少于这么多像素当作没看见，滤掉噪点
-constexpr int kLostStopFrames = 6;      // 刚跟丢先停 6 帧（约 0.4 秒），别立刻乱转
-constexpr int kSearchFrames = 120;      // 再原地搜 120 帧（约 8 秒）才彻底放弃
-constexpr int kLoopPeriodMs = 66;       // 上层目标 15fps，实际帧率受摄像头限制
+// 少于这么多像素当作没看见。原来设 45（直径约 8px），目标稍一拉远就判丢、
+// 于是停车不动 —— 实测体感"稍微远一点就不跟了"。降到 24 约合直径 5.5px，
+// 噪点由 IsVivid 的饱和度门和 best_cnt>=4 的成块要求双重兜着。
+constexpr int kMinPixels = 24;
+// 跟丢多久就彻底退出。⚠️ 丢目标期间一律停车，绝不原地转着找：
+// 底盘是开环的，车在原地扫视时用户往往正站在旁边，这个动作既吓人又容易撞。
+constexpr int kLostExitMs = 2000;
+// 每轮额外睡这么久。原来设 66ms（想卡 15fps），但 esp_camera_fb_get() 本身
+// 就会阻塞到有帧，两段加起来实际只有 7fps 左右，转向响应慢半拍。
+constexpr int kLoopPeriodMs = 10;
 constexpr int kTaskStack = 5120;
 // ⚠️ 必须是 2，不能更高。AFE 的取数任务（audio_communication）优先级是 3，
 // audio_output 是 4，audio_input 是 8。设成 4 的话本任务和 audio_output 同级、
@@ -38,8 +44,11 @@ constexpr int kTaskStack = 5120;
 // AFE 的 ringbuffer 就会被喂满 —— 表现是串口刷
 // "AFE: Ringbuffer of AFE(FEED) is full"。降到 2 之后，任何音频任务都能抢占它。
 constexpr int kTaskPrio = 2;
-constexpr int kAreaDeadbandMilli = 15;  // 面积死区 1.5%，防止原地前后抽动
-constexpr float kAreaGain = 6.0f;       // 面积误差 -> 速度的增益
+constexpr int kAreaDeadbandMilli = 10;  // 面积死区 1%，防止原地前后抽动
+constexpr float kAreaGain = 9.0f;       // 面积误差 -> 速度的增益
+// 目标小于这个面积（千分比）就别再抠面积误差了，直接给满速往前追。
+// 远处目标像素少、面积算出来抖得厉害，按比例算反而越追越慢。
+constexpr int kFarAreaMilli = 12;
 
 // 单遍扫描的累加桶。放静态区而不是栈上：这三块加起来 2.5KB，
 // 放 5KB 的任务栈里会把栈顶爆掉。
@@ -246,6 +255,7 @@ void TaskEntry(void* arg) {
     float prev_cx = 0.0f;
     bool warned_format = false;
     int fb_fail = 0;
+    int64_t lost_start_us = 0;
 
     while (!s.stop_req.load()) {
         const int elapsed_ms = static_cast<int>((esp_timer_get_time() - t0) / 1000);
@@ -311,20 +321,25 @@ void TaskEntry(void* arg) {
             s.lost.store(lost);
             s.pixels.store(0);
             s.area_permille.store(0);
-            if (lost < kLostStopFrames) {
-                // 刚丢：先停，别让车按上一帧的方向继续冲
-                on_motion(0.0f, 0.0f);
-            } else if (lost < kLostStopFrames + kSearchFrames) {
-                // 丢了一会儿：原地慢慢转着找。不前进，避免撞上丢之前那个方向的障碍
-                on_motion(0.5f, 0.0f);
-            } else {
-                ESP_LOGI(TAG, "原地找了 %d 帧仍没找到目标，结束跟随", kSearchFrames);
+            s.out_x_milli.store(0);
+            s.out_y_milli.store(0);
+            // 丢目标一律原地停车。⚠️ 不要改成"原地转着找"——底盘是开环的，
+            // 车在原地扫视时用户往往正站在旁边，既吓人又容易撞，
+            // 而且用户会理解为"目标都没了它还在自己动"。
+            on_motion(0.0f, 0.0f);
+            if (lost_start_us == 0) {
+                lost_start_us = now;
+                ESP_LOGW(TAG, "目标丢失，停车等待 %d 毫秒（这期间只在原地等，不移动）", kLostExitMs);
+            } else if (now - lost_start_us > static_cast<int64_t>(kLostExitMs) * 1000) {
+                ESP_LOGI(TAG, "目标已丢失 %d 毫秒，结束跟随", kLostExitMs);
                 break;
             }
         } else {
-            if (lost >= kLostStopFrames) {
-                ESP_LOGI(TAG, "重新捕获目标，命中 %d 像素", det.pixels);
+            if (lost_start_us != 0) {
+                ESP_LOGI(TAG, "重新捕获目标：%d 像素，此前丢失 %d 毫秒",
+                         det.pixels, static_cast<int>((now - lost_start_us) / 1000));
             }
+            lost_start_us = 0;
             lost = 0;
             s.lost.store(0);
 
@@ -337,8 +352,13 @@ void TaskEntry(void* arg) {
             float y = 0.0f;
             if (err_permille > kAreaDeadbandMilli || err_permille < -kAreaDeadbandMilli) {
                 // err 是真千分比，先除回 0~1 再乘增益：目标占 8% 而当前只占 2% 时，
-                // err=60 -> y=0.36，正好是"明显偏小就中速前进"的手感。
+                // err=60 -> y=0.54，"明显偏小就快速前进"。
                 y = static_cast<float>(err_permille) / 1000.0f * kAreaGain;
+            }
+            if (area_permille < kFarAreaMilli) {
+                // 目标已经很小了（通常是拉远了）：这时候面积算得抖，按比例给速度
+                // 会越追越慢甚至停住，干脆给满速追上去。
+                y = cfg.max_speed;
             }
             if (area_permille > 500) {
                 // 目标已经糊满半个画面，贴脸了，无论面积误差怎么算都先撤
@@ -348,6 +368,11 @@ void TaskEntry(void* arg) {
 
             float x = cfg.kp * cx + cfg.kd * (cx - prev_cx);
             prev_cx = cx;
+            // 转向死区：目标基本在正中时别左右抽。kp 提到 1.6 后，偏画面 1/13
+            // 就会给出 0.12 的转向量，没有死区车会一直小幅摆。
+            if (x < 0.12f && x > -0.12f) {
+                x = 0.0f;
+            }
             x = Clamp(x, -1.0f, 1.0f);
 
             s.pixels.store(det.pixels);
