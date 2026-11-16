@@ -20,11 +20,13 @@
 #include <freertos/semphr.h>
 #include <cstdio>
 #include <cstring>
+#include <atomic>
 
 #include "esp32_camera.h"
 #include "wifi_remote_control.h"
 #include "sparkbot_battery.h"
 #include "cube_view.h"
+#include "visual_follow.h"
 
 #define TAG "esp_sparkbot"
 
@@ -82,6 +84,12 @@ private:
     static constexpr int kMotionResendMs = 100;   // 看门狗 500ms，100ms 重发留足余量
     static constexpr int kMotionStackSize = 3072;
     static constexpr int kContinuousMaxMs = 60000;  // 无限运动的安全上限：60 秒
+
+    // 视觉跟随时，底盘写入权在跟随任务手上。这个标志就是"谁在控制底盘"：
+    // 跟随任务每帧调 ApplyFollowMotion，一旦有人接管就靠它立刻停止写入，
+    // 不用等任务退出——任务可能正卡在 esp_camera_fb_get() 里最多一秒，
+    // 这一秒里如果两边都在发指令，车会左右乱抖。
+    std::atomic<bool> follow_owns_motion_{false};
 
     // ── 原地转向标定 ────────────────────────────────────────────────
     // 整条链路没有任何角度反馈：底盘没有编码器、串口是单向只发不收、
@@ -555,12 +563,49 @@ private:
         snprintf(out, out_size, "%s%d.%02d", negative ? "-" : "", scaled / 100, scaled % 100);
     }
 
+    // 跟随任务每帧调这个，直接改写运动状态，不走 StartMotion：
+    // StartMotion 每次都会重置 deadline 并打一条日志，15fps 下会把串口日志刷爆。
+    // 注意这里不设 follow_owns_motion_，写入权只由"启动跟随"和StopMotion()两处决定，
+    // 否则用户一停车，下一帧又被跟随任务覆盖回来了。
+    void ApplyFollowMotion(float x, float y) {
+        if (!follow_owns_motion_.load()) {
+            return;
+        }
+        if (motion_mutex_ == nullptr) {
+            return;
+        }
+        if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(20)) != pdTRUE) {
+            return;
+        }
+        motion_x_ = x;
+        motion_y_ = y;
+        motion_continuous_ = true;
+        // 跟随是持续行为，deadline 每帧往后推，否则会撞上 60 秒安全上限被误判为超时
+        motion_deadline_ = xTaskGetTickCount() + pdMS_TO_TICKS(kContinuousMaxMs);
+        motion_running_ = true;
+        xSemaphoreGive(motion_mutex_);
+    }
+
+    // 跟随任务自己走完（跑满时限、长时间找不到目标）时的收尾，由任务上下文调用。
+    // 这里只停车，不再反向调 vfollow::Stop()，否则会绕成自我取消。
+    void OnFollowTaskExit() {
+        StopMotion();
+        ESP_LOGI(TAG, "视觉跟随结束，底盘已停车");
+    }
+
     // duration_ms > 0：走这么久后主动停车；duration_ms <= 0：一直走，直到 stop
     // （仍然保留 60 秒安全上限，避免模型忘了停车导致小车撞墙）
     void StartMotion(float x, float y, int duration_ms) {
         if (motion_mutex_ == nullptr) {
             return;
         }
+        // 语音或工具下达的运动指令要接管底盘，先把视觉跟随请走，
+        // 否则两个写入者会互相覆盖，车会一顿一顿地抖。
+        // 这一步必须在取 motion_mutex_ 之前做：StopMotion 内部也会拿这把锁。
+        if (vfollow::IsRunning()) {
+            vfollow::Stop();
+        }
+        follow_owns_motion_.store(false);
         if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
             ESP_LOGW(TAG, "底盘状态忙，忽略本次运动指令");
             return;
@@ -665,12 +710,22 @@ private:
         if (motion_mutex_ == nullptr) {
             return;
         }
+        // 停车就顺手让视觉跟随收工。只置一个原子标志、不取锁也不等待，
+        // 所以从摇杆那条每 150ms 调一次的路径上走也安全。
+        // 不这么做的话，用户喊"停"之后车是停了，但跟随任务还会 15fps 空转扫到 3 分钟上限，
+        // 白白发热耗电。
+        if (vfollow::IsRunning()) {
+            vfollow::Stop();
+        }
         if (xSemaphoreTake(motion_mutex_, pdMS_TO_TICKS(100)) != pdTRUE) {
             return;
         }
         bool was_running = motion_running_;
         motion_running_ = false;
         motion_continuous_ = false;
+        // 停车 = 交出底盘写入权。视觉跟随任务可能还活着，靠这一行让它下一帧就停写，
+        // 不用等它退出（它可能正卡在取帧里）。
+        follow_owns_motion_.store(false);
         xSemaphoreGive(motion_mutex_);
         // 手机摇杆每 150ms 都会调一次，只在真的从"在走"变"停"时打日志
         if (was_running) {
@@ -900,6 +955,66 @@ private:
             return true;
         });
 
+        // ── 视觉跟随 ─────────────────────────────────────────────────────
+        // 跟的是"一种颜色"，不是"某个东西"。本板摄像头出的是 RGB565 原始像素，
+        // 逐像素判色就能算质心，所以这里不需要任何模型，也不需要联网。
+        mcp_server.AddTool("self.follow.start",
+            "开始视觉跟随：小车用摄像头盯住指定颜色的物体，自己转向并保持距离地跟着走。"
+            "hue 0=红 1=绿 2=蓝；target_area 是希望目标占画面的百分比，越大跟得越近，8 表示跟到目标约占总画面一成。"
+            "这是持续行为，调用后立刻返回，车会一直跟下去，直到用户喊停、目标连续 8 秒找不到、或跑满 3 分钟。"
+            "回复用户时要说“车已经开始跟着走了，随时可以让我停”，不要说已经跟完了",
+            PropertyList({
+                Property("hue", kPropertyTypeInteger, 0, 0, 2),
+                Property("target_area", kPropertyTypeInteger, 8, 3, 25)
+            }), [this](const PropertyList& properties) -> ReturnValue {
+            int hue = properties["hue"].value<int>();
+            int area_pct = properties["target_area"].value<int>();
+            if (camera_ == nullptr) {
+                return std::string("摄像头没有初始化成功，做不了视觉跟随");
+            }
+            if (vfollow::IsRunning()) {
+                return std::string("已经在跟着了。要换目标颜色，先让我停一下再重新开始");
+            }
+
+            vfollow::Config cfg;
+            cfg.hue = static_cast<vfollow::TargetHue>(hue);
+            cfg.target_area = area_pct / 100.0f;
+            bool ok = vfollow::Start(cfg,
+                [this](float x, float y) { ApplyFollowMotion(x, y); },
+                [this]() { OnFollowTaskExit(); });
+            if (!ok) {
+                return std::string("启动失败：上一轮跟随还在收尾，或者任务创建不出来，过一秒再试");
+            }
+            follow_owns_motion_.store(true);
+
+            char buf[168];
+            snprintf(buf, sizeof(buf),
+                     "已开始跟随%s色物体，让它保持在画面约 %d%% 的大小。车现在会自己动，说停才会停",
+                     hue == 0 ? "红" : (hue == 1 ? "绿" : "蓝"), area_pct);
+            return std::string(buf);
+        });
+
+        mcp_server.AddTool("self.follow.stop",
+            "停止视觉跟随并让车停住。用户说别跟了、停下、停一停、够了的时候调用",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            if (!vfollow::IsRunning()) {
+                StopMotion();
+                return std::string("当前没有在跟随，车是停着的");
+            }
+            // 先停车再请求停止：StopMotion 会立刻清掉写入权，车当场停住，
+            // 不用等跟随任务从取帧里退出来（那最长要一秒）。
+            StopMotion();
+            vfollow::Stop();
+            return std::string("已停止跟随，车停住了");
+        });
+
+        mcp_server.AddTool("self.follow.get_status",
+            "查看视觉跟随的实时状态：是否在跟、命中多少像素、目标偏左还是偏右、当前车速和帧率。"
+            "车跟不动、跟丢、或者怀疑颜色认错时用它诊断",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+            return vfollow::GetStatusJson();
+        });
+
         mcp_server.AddTool("self.camera.set_camera_flipped", "翻转摄像头图像方向（在正常和旋转180°之间切换，用户说画面反了/倒了时调用）", PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
             Settings settings("sparkbot", true);
             int orient = settings.GetInt("camera-orient", kCameraOrientDefault);
@@ -996,6 +1111,11 @@ public:
             [this](const std::string& cmd) {
                 // 手机摇杆一接管就取消语音设定的持续运动，否则松手后车又被重发指令带跑
                 StopMotion();
+                // 摇杆优先级高于视觉跟随：用户手一碰摇杆，跟随就让位。
+                // 网页端是 if(dragging) 才发指令，不拖动时不会走到这里，所以不会误伤跟随。
+                if (vfollow::IsRunning()) {
+                    vfollow::Stop();
+                }
                 SendUartMessage(cmd.c_str());
             },
             [this](size_t* len) -> uint8_t* {
