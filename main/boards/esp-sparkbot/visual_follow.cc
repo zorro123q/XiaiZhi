@@ -32,7 +32,12 @@ constexpr int kLostStopFrames = 6;      // 刚跟丢先停 6 帧（约 0.4 秒�
 constexpr int kSearchFrames = 120;      // 再原地搜 120 帧（约 8 秒）才彻底放弃
 constexpr int kLoopPeriodMs = 66;       // 上层目标 15fps，实际帧率受摄像头限制
 constexpr int kTaskStack = 5120;
-constexpr int kTaskPrio = 4;            // 低于音频任务，高于显示任务
+// ⚠️ 必须是 2，不能更高。AFE 的取数任务（audio_communication）优先级是 3，
+// audio_output 是 4，audio_input 是 8。设成 4 的话本任务和 audio_output 同级、
+// 高于 AFE 取数任务，而扫一帧要在不让出 CPU 的情况下跑好几毫秒，
+// AFE 的 ringbuffer 就会被喂满 —— 表现是串口刷
+// "AFE: Ringbuffer of AFE(FEED) is full"。降到 2 之后，任何音频任务都能抢占它。
+constexpr int kTaskPrio = 2;
 constexpr int kAreaDeadbandMilli = 15;  // 面积死区 1.5%，防止原地前后抽动
 constexpr float kAreaGain = 6.0f;       // 面积误差 -> 速度的增益
 
@@ -50,6 +55,7 @@ struct State {
     Config cfg;
     MotionSink on_motion;
     ExitSink on_exit;
+    FrameSink on_frame;
 
     // 对外的观测值，供状态查询和诊断
     std::atomic<int> frames{0};
@@ -81,8 +87,8 @@ inline float Clamp(float v, float lo, float hi) {
 // 传感器吐的是大端 RGB565：Capture() 里也是先 __builtin_bswap16 再喂给 LVGL 的。
 // 这里保持同一套字节序，识别到的颜色才和用户在预览里看到的一致，
 // 否则红蓝会对调，表现为"明明是红球却跟不动"。
-inline void DecodeRgb565(uint16_t raw, int* r, int* g, int* b) {
-    const uint16_t p = __builtin_bswap16(raw);
+// 注意：调用方必须已经 bswap 过。扫帧和写预览共用同一次转换，不重复转。
+inline void DecodeBswapped(uint16_t p, int* r, int* g, int* b) {
     *r = static_cast<int>((p >> 11) & 0x001F) * 255 / 31;
     *g = static_cast<int>((p >> 5) & 0x003F) * 255 / 63;
     *b = static_cast<int>(p & 0x001F) * 255 / 31;
@@ -133,7 +139,10 @@ struct Detection {
 // 单遍扫描整帧：命中的像素按 15x15 像素归到 16x16 的格子里，同时累加
 // 格内像素的坐标和。扫完就知道哪一格最密，再把那一格周围 7x7 格加起来，
 // 一次得到精确质心和总面积，不用扫第二遍。
-bool Analyze(const uint8_t* buf, TargetHue hue, Detection* out) {
+//
+// preview 非空时顺手把 bswap 后的像素写进去，屏幕上就能同步看到画面。
+// 复用同一次字节序转换，比事后再整帧拷一遍省一半时间。
+bool Analyze(const uint8_t* buf, TargetHue hue, uint16_t* preview, Detection* out) {
     if (buf == nullptr) {
         return false;
     }
@@ -146,17 +155,27 @@ bool Analyze(const uint8_t* buf, TargetHue hue, Detection* out) {
 
     const uint16_t* src = reinterpret_cast<const uint16_t*>(buf);
     for (int y = 0; y < kFrameH; y++) {
+        // 每 16 行让出一次 CPU。本任务优先级已经低于全部音频任务，
+        // 但和 opus 编码（2）、骰子渲染（2）同级，长时间独占会让它们卡顿。
+        if ((y & 15) == 0) {
+            taskYIELD();
+        }
         const int gy = y / kCell;
         const uint16_t* row = src + y * kFrameW;
+        uint16_t* prow = (preview != nullptr) ? (preview + y * kFrameW) : nullptr;
         uint16_t* cnt_row = s_cnt + gy * kGrid;
         uint32_t* sx_row = s_sumx + gy * kGrid;
         uint32_t* sy_row = s_sumy + gy * kGrid;
         for (int x = 0; x < kFrameW; x++) {
+            const uint16_t p = __builtin_bswap16(row[x]);
+            if (prow != nullptr) {
+                prow[x] = p;
+            }
             int r = 0;
             int g = 0;
             int b = 0;
             int dominant = 0;
-            DecodeRgb565(row[x], &r, &g, &b);
+            DecodeBswapped(p, &r, &g, &b);
             if (!IsVivid(r, g, b, &dominant)) {
                 continue;
             }
@@ -217,6 +236,7 @@ void TaskEntry(void* arg) {
     const Config cfg = s.cfg;
     const MotionSink on_motion = s.on_motion;
     const ExitSink on_exit = s.on_exit;
+    const FrameSink on_frame = s.on_frame;
 
     const int64_t t0 = esp_timer_get_time();
     int lost = 0;
@@ -256,7 +276,7 @@ void TaskEntry(void* arg) {
             static_cast<int>(fb->width) == kFrameW &&
             static_cast<int>(fb->height) == kFrameH &&
             fb->len >= static_cast<size_t>(kFrameW) * kFrameH * 2) {
-            found = Analyze(fb->buf, cfg.hue, &det);
+            found = Analyze(fb->buf, cfg.hue, cfg.preview_buffer, &det);
         } else if (!warned_format) {
             ESP_LOGE(TAG, "帧格式不符合预期：fmt=%d %dx%d len=%d（需要 RGB565 %dx%d 且 len>=%d）",
                      static_cast<int>(fb->format), static_cast<int>(fb->width),
@@ -278,6 +298,13 @@ void TaskEntry(void* arg) {
         s.hue_hit_red.store(s_hue_hits[0]);
         s.hue_hit_green.store(s_hue_hits[1]);
         s.hue_hit_blue.store(s_hue_hits[2]);
+
+        // 预览：像素在上面 Analyze() 里已经顺手填好了，这里只负责按节流刷屏。
+        // 从第一帧就刷（frames 是 1 起），让用户一启动就能看到画面。
+        if (on_frame && cfg.preview_buffer != nullptr && cfg.preview_every_n_frames > 0 &&
+            ((frames - 1) % cfg.preview_every_n_frames) == 0) {
+            on_frame();
+        }
 
         if (!found) {
             lost++;
@@ -344,6 +371,7 @@ void TaskEntry(void* arg) {
     }
     s.on_motion = nullptr;
     s.on_exit = nullptr;
+    s.on_frame = nullptr;
     s.task = nullptr;
     s.running.store(false);
     ESP_LOGI(TAG, "跟随任务结束，共处理 %d 帧", frames);
@@ -352,13 +380,14 @@ void TaskEntry(void* arg) {
 
 }  // namespace
 
-bool Start(const Config& cfg, MotionSink on_motion, ExitSink on_exit) {
+bool Start(const Config& cfg, MotionSink on_motion, ExitSink on_exit, FrameSink on_frame) {
     if (s.running.load()) {
         return false;
     }
     s.cfg = cfg;
     s.on_motion = std::move(on_motion);
     s.on_exit = std::move(on_exit);
+    s.on_frame = std::move(on_frame);
     s.stop_req.store(false);
     s.frames.store(0);
     s.fps_milli.store(0);
@@ -378,6 +407,7 @@ bool Start(const Config& cfg, MotionSink on_motion, ExitSink on_exit) {
         s.running.store(false);
         s.on_motion = nullptr;
         s.on_exit = nullptr;
+        s.on_frame = nullptr;
         ESP_LOGE(TAG, "创建跟随任务失败（内存不足）");
         return false;
     }

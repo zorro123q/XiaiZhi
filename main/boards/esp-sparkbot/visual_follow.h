@@ -1,6 +1,7 @@
 #ifndef VISUAL_FOLLOW_H
 #define VISUAL_FOLLOW_H
 
+#include <cstdint>
 #include <functional>
 #include <string>
 
@@ -33,6 +34,8 @@ enum class TargetHue {
 using MotionSink = std::function<void(float x, float y)>;
 // 任务自己结束（跑满时限、长时间找不到目标）时的收尾回调，调用方负责真正停车。
 using ExitSink = std::function<void()>;
+// 一帧的预览像素写完之后，通知调用方去刷屏。
+using FrameSink = std::function<void()>;
 
 struct Config {
     TargetHue hue = TargetHue::kRed;
@@ -44,11 +47,20 @@ struct Config {
     float kd = 0.35f;
     float max_speed = 0.55f;
     int max_duration_ms = 180000;
+
+    // 可选：跟随过程中顺手把画面写进这块 240x240 的 RGB565 缓冲，
+    // 屏幕上就能同时看到摄像头看到的东西。传 nullptr 就不预览。
+    // 缓冲区由调用方分配并保证生命周期，这里只负责填像素。
+    uint16_t* preview_buffer = nullptr;
+    // 预览每几帧刷一次。填像素几乎免费（扫帧时顺手 bswap 一次就有了），
+    // 贵的是刷屏：120x120 的区域重绘约 29KB SPI 传输，每帧都刷会把 LVGL 拖垮。
+    int preview_every_n_frames = 2;
 };
 
 // 起一个独立的跟随任务。它自己会持续驱动底盘，调用方不要在工具回调里等它。
 // 返回 false 表示上一轮还没收尾完，或者任务创建失败。
-bool Start(const Config& cfg, MotionSink on_motion, ExitSink on_exit);
+bool Start(const Config& cfg, MotionSink on_motion, ExitSink on_exit,
+           FrameSink on_frame = nullptr);
 
 // 只置停止标志后立即返回，不等待任务退出。
 // 这个函数会在 MCP 工具回调里被调用，而工具回调跑在 Application 主任务上，

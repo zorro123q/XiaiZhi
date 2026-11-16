@@ -42,6 +42,14 @@ public:
     virtual std::string IdentifyPerson(const std::string& question) override;
     // 抓一帧转 JPEG（网页实时预览用），返回 malloc 缓冲区，调用方 free
     virtual uint8_t* SnapshotJpeg(size_t* out_len, int quality = 70) override;
+
+    // 给"持续取帧"的功能（视觉跟随等）用：拿到预览缓冲的裸指针直接写像素，
+    // 写完调 CommitPreview() 刷一次屏。比每帧走一遍 Capture() 便宜得多——
+    // 那个会连取两帧、还会动 fb_ 成员。缓冲没分配时返回 nullptr。
+    uint16_t* PreviewBuffer();
+    void CommitPreview();
+    // 收起预览，恢复表情显示
+    void HidePreview();
 };
 
 #endif // ESP32_CAMERA_H

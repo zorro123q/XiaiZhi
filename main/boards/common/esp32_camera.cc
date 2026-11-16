@@ -356,3 +356,31 @@ uint8_t* Esp32Camera::SnapshotJpeg(size_t* out_len, int quality) {
     *out_len = jpg_len;
     return jpg;
 }
+
+// ===== 持续取帧用的预览接口 =====
+// 视觉跟随这类功能每帧都拿得到新像素，没必要走 Capture()——那个会连取两帧、
+// 还要动 fb_ 成员，和网页快照流抢得更凶。
+
+uint16_t* Esp32Camera::PreviewBuffer() {
+    // preview_image_.data 在构造时按 frame_size 分配成 w*h*2 的 RGB565 缓冲，
+    // 这里把 const 洗掉交给调用方写像素。仅用于"写完立刻 CommitPreview"的短路径。
+    return reinterpret_cast<uint16_t*>(const_cast<uint8_t*>(preview_image_.data));
+}
+
+void Esp32Camera::CommitPreview() {
+    if (preview_image_.data == nullptr) {
+        return;
+    }
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        // SetPreviewImage 内部自己加 LVGL 锁，外面不要再套一层，会死锁
+        display->SetPreviewImage(&preview_image_);
+    }
+}
+
+void Esp32Camera::HidePreview() {
+    auto display = Board::GetInstance().GetDisplay();
+    if (display != nullptr) {
+        display->SetPreviewImage(nullptr);
+    }
+}

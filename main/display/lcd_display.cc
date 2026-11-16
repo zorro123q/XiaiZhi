@@ -859,6 +859,10 @@ void LcdDisplay::SetPreviewImage(const lv_img_dsc_t* img_dsc) {
             lv_image_set_scale(preview_image_, 128 * width_ / img_dsc->header.w);
         }
         lv_obj_remove_flag(preview_image_, LV_OBJ_FLAG_HIDDEN);
+        // 视觉跟随这类持续取帧的功能会反复传同一个 lv_img_dsc_t 指针、只换里面的像素。
+        // lv_image_set_src 发现 src 没变不会触发重绘，画面就冻在第一帧了，
+        // 所以这里必须显式失效一次。对只设置一次调用方的开销可以忽略。
+        lv_obj_invalidate(preview_image_);
         // 隐藏emotion_label_
         if (emotion_label_ != nullptr) {
             lv_obj_add_flag(emotion_label_, LV_OBJ_FLAG_HIDDEN);

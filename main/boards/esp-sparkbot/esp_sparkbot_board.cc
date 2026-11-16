@@ -590,7 +590,12 @@ private:
     // 这里只停车，不再反向调 vfollow::Stop()，否则会绕成自我取消。
     void OnFollowTaskExit() {
         StopMotion();
-        ESP_LOGI(TAG, "视觉跟随结束，底盘已停车");
+        // 收起预览、把表情放回来。不这么做的话屏幕中央会一直定格在最后一帧，
+        // 用户还以为摄像头还在工作。
+        if (camera_ != nullptr) {
+            camera_->HidePreview();
+        }
+        ESP_LOGI(TAG, "视觉跟随结束，底盘已停车，预览已收起");
     }
 
     // duration_ms > 0：走这么久后主动停车；duration_ms <= 0：一直走，直到 stop
@@ -979,17 +984,22 @@ private:
             vfollow::Config cfg;
             cfg.hue = static_cast<vfollow::TargetHue>(hue);
             cfg.target_area = area_pct / 100.0f;
+            // 顺手把画面送到屏幕上，用户能直接看见摄像头看到的东西。
+            // 跟随任务在扫帧时就把像素填进这块缓冲了，这里只是把地址给它。
+            cfg.preview_buffer = camera_->PreviewBuffer();
             bool ok = vfollow::Start(cfg,
                 [this](float x, float y) { ApplyFollowMotion(x, y); },
-                [this]() { OnFollowTaskExit(); });
+                [this]() { OnFollowTaskExit(); },
+                [this]() { camera_->CommitPreview(); });
             if (!ok) {
                 return std::string("启动失败：上一轮跟随还在收尾，或者任务创建不出来，过一秒再试");
             }
             follow_owns_motion_.store(true);
 
-            char buf[168];
+            char buf[200];
             snprintf(buf, sizeof(buf),
-                     "已开始跟随%s色物体，让它保持在画面约 %d%% 的大小。车现在会自己动，说停才会停",
+                     "已开始跟随%s色物体，让它保持在画面约 %d%% 的大小。"
+                     "屏幕上会同时显示摄像头看到的画面，车现在会自己动，说停才会停",
                      hue == 0 ? "红" : (hue == 1 ? "绿" : "蓝"), area_pct);
             return std::string(buf);
         });
