@@ -172,36 +172,6 @@ private:
             }
             app.ToggleChatState();
         });
-
-#if CONFIG_USE_SERVER_AEC
-        // 实时对话（服务器端 AEC）开关。本板只有一颗 ES8311，没有回声参考通道，
-        // 所以用不了设备端 AEC（CONFIG_USE_DEVICE_AEC），只能让服务器拿它自己下发的
-        // TTS 做参考来消回声。开启后设备播放回复时保持拾音，可以直接说话打断。
-        // 用长按而不是双击：注册双击会让上面单击的响应多等一个双击窗口，伤手感。
-        boot_button_.OnLongPress([this]() {
-            auto& app = Application::GetInstance();
-            if (app.GetDeviceState() != kDeviceStateIdle) {
-                return;
-            }
-            bool turn_on = app.GetAecMode() == kAecOff;
-            app.SetAecMode(turn_on ? kAecOnServerSide : kAecOff);
-            Settings settings("sparkbot", true);
-            settings.SetBool("realtime", turn_on);
-            ESP_LOGI(TAG, "Realtime conversation %s (saved)", turn_on ? "enabled" : "disabled");
-        });
-
-        // 开机恢复上次的选择。默认构造出来就是开启态，所以只有"关闭"需要动作，
-        // 正常开启时不去碰它，免得开机白弹一条通知。
-        {
-            Settings settings("sparkbot", false);
-            bool realtime = settings.GetBool("realtime", true);
-            if (!realtime) {
-                Application::GetInstance().SetAecMode(kAecOff);
-            }
-            ESP_LOGI(TAG, "Realtime conversation (server AEC) %s, long-press BOOT to toggle",
-                     realtime ? "enabled" : "disabled");
-        }
-#endif
     }
 
     /*
@@ -1077,12 +1047,33 @@ private:
         // 渲染完全自己算（软光栅），不占用音频/网络的算力，但会持续刷屏。
         // 所以工具描述里要提醒模型：这是"展示模式"，要退出得显式调用 hide。
         mcp_server.AddTool("self.cube.show",
-            "在屏幕上显示一个 3D 骰子，目前会自己慢慢转动。"
-            "用户说“显示一个立方体”“玩骰子”“把骰子拿出来”“打开那个方块”时调用。"
+            "在屏幕上显示一个 3D 骰子并立刻掷一次（屏幕会翻滚约 2 秒后停稳）。"
+            "用户说“显示一个立方体”“把骰子拿出来”“打开那个方块”时调用。"
+            "只想掷骰子、不关心显示过程的话用 self.cube.roll。"
             "显示期间屏幕会被骰子占满（状态栏也看不到），要看别的内容必须先调 self.cube.hide",
             PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
-                cubetoy::Show();
-                return std::string("骰子已经显示在屏幕上，正在自转。要看别的画面记得调用 self.cube.hide");
+                int pips = cubetoy::Roll();
+                if (pips == 0) {
+                    return std::string("骰子还没初始化好，显示失败");
+                }
+                return std::string("骰子已显示，正在翻滚，约 1.6 秒后停稳，结果是 ") +
+                       std::to_string(pips) + " 点";
+            });
+
+        // 掷骰子：点数在调用瞬间就已经定了（先定落点再倒推动画），
+        // 所以这里可以立刻回答，不用等画面停——MCP 回调绝对不能阻塞。
+        mcp_server.AddTool("self.cube.roll",
+            "掷一次 3D 骰子，得到 1~6 点。调用时就能拿到结果点数，屏幕上会同步翻滚约 1.6 秒。"
+            "用户说“掷个骰子”“摇一摇”“来一把”“随机选个数字”“赌一把”时调用。"
+            "骰子没显示的话这个工具会自动显示。连续掷要间隔 2 秒以上，"
+            "别对用户说“已经停稳了”，因为画面还在滚。",
+            PropertyList(), [this](const PropertyList& properties) -> ReturnValue {
+                int pips = cubetoy::Roll();
+                if (pips == 0) {
+                    return std::string("骰子还没初始化好，掷不了");
+                }
+                return std::string("{\"pips\":") + std::to_string(pips) +
+                       ",\"settle_ms\":1600,\"note\":\"点数已定，画面仍在翻滚，约 1.6 秒后可见\"}";
             });
 
         mcp_server.AddTool("self.cube.hide", "关闭屏幕上的 3D 骰子，恢复正常界面",

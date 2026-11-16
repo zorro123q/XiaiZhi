@@ -12,8 +12,13 @@ class Display;
  * 渲染路径是自己写的软光栅（不走 tinyGL，也不用 LVGL 的自定义控件），
  * 所以只依赖 lv_canvas + 一个 RGB565 缓冲区，跨 LVGL 版本没有兼容问题。
  *
- * 第 1 轮：角度由固定速度自转驱动。
- * 第 2 轮：接上 IMU 后改调 SetAttitude()，由板子姿态驱动。
+ * 交互沿用官方 factory_demo 的手感：先翻滚、再减速、最后吸附到整面。
+ * 区别在"结果怎么来"——官方靠 IMU 差分角自然停到某面，本实现先随机定落点再倒推动画，
+ * 这样掷的瞬间就能拿到点数，不用等画面停（工具回调里绝不能阻塞）。
+ *
+ * 第 1 轮：固定自转（已移除）。
+ * 第 2 轮：Roll() 掷骰 + 惯性吸附落点。
+ * 第 3 轮：接上 IMU 后改调 SetAttitude()，由板子姿态驱动。
  */
 namespace cubetoy {
 
@@ -30,7 +35,12 @@ void Show();
 void Hide();
 bool IsVisible();
 
-// 供第 2 轮 IMU 使用：单位为度
+// 掷一次骰子：随机挑一个"某一面正对镜头"的落点，播放约 1.6 秒的翻滚动画，
+// 立即返回最终点数 1~6（失败返回 0）。动画在渲染任务里跑，调用方不阻塞。
+// 骰子没显示时会自动先显示出来。
+int Roll();
+
+// 供第 3 轮 IMU 使用：单位为度
 void SetAttitude(float pitch, float roll, float yaw);
 
 }  // namespace cubetoy

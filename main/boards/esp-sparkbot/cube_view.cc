@@ -4,6 +4,8 @@
 #include <esp_err.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
+#include <esp_random.h>
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <math.h>
@@ -26,7 +28,13 @@ constexpr int kHalf = kSize / 2;    // 100，既是画布中心也是投影的�
 constexpr float kFovDeg = 35.0f;    // 视场角：越小透视越平、越不像鱼眼
 constexpr float kDist = 6.0f;       // 相机到骰子中心的距离（以骰子半径为单位）
 constexpr int kFrameMs = 40;        // 25fps。再快 SPI 也刷不动 200x200
-constexpr float kSpinDegPerFrame = 0.5f;  // 自转速度 ≈12.5°/s，转一圈约 29 秒
+constexpr int kRollMs = 1600;       // 一次掷骰的时长：40 帧，够看清翻滚又不会拖沓
+
+// 固定观察角：相机从左上方斜看（俯 16°、偏左 22°），任何朝向的骰子都能同时
+// 露出顶面和侧面。骰子本身严格吸附到整面，点阵不会因为"倾斜"而变歪。
+// 实现上等价于把物体反向转一次，不用真的搭相机矩阵。
+constexpr float kCamPitch = 16.0f;
+constexpr float kCamYaw = -22.0f;
 
 const float kFocal = 1.0f / tanf(kFovDeg * 0.5f * (float)M_PI / 180.0f);  // ≈3.17
 
@@ -38,9 +46,30 @@ uint16_t* s_buf = nullptr;     // kSize*kSize 的像素缓冲
 TaskHandle_t s_task = nullptr;
 volatile bool s_visible = false;
 
+// 当前角度（只有渲染任务会写，所以不用锁）
 float s_pitch = 22.0f;  // 绕 X
 float s_roll = 10.0f;   // 绕 Z
-float s_yaw = 0.0f;     // 绕 Y，自转时递增
+float s_yaw = 0.0f;     // 绕 Y
+
+// 掷骰状态。Roll() 跑在 Application 主任务里，渲染任务在另一个任务，
+// 所以"请求"和"正在播的动画"这两组变量都要走临界区。
+enum class Phase { kIdle, kRolling };
+
+portMUX_TYPE s_mux = portMUX_INITIALIZER_UNLOCKED;
+bool s_req = false;             // 有新的掷骰请求
+float s_req_pitch = 0;          // 请求的落点（下面是归一化前的原始角度）
+float s_req_roll = 0;
+float s_req_yaw = 0;
+int s_req_turns = 1;            // 多转几圈，看起来才像在滚
+
+Phase s_phase = Phase::kIdle;
+uint32_t s_roll_start_ms = 0;
+float s_from_pitch = 0;         // 本次动画的起点
+float s_from_roll = 0;
+float s_from_yaw = 0;
+float s_to_pitch = 0;           // 本次动画的终点（= 落点 + 360k，和落点朝向完全一致）
+float s_to_roll = 0;
+float s_to_yaw = 0;
 
 std::string s_probe_summary = "尚未扫描";
 
@@ -80,6 +109,12 @@ V3 Rotate(const V3& v, float pitch, float roll, float yaw) {
     float y3 = x1 * sz + y2 * cz;
 
     return {x3, y3, z2};
+}
+
+// 相机观察变换：把世界坐标转到"相机三轴对齐、朝 -z 看"的视空间。
+// 反向转一次就够了，不需要完整视图矩阵。
+V3 Cam(const V3& v) {
+    return Rotate(v, kCamPitch, 0.0f, kCamYaw);
 }
 
 P2 Project(const V3& view) {
@@ -214,7 +249,7 @@ void Render() {
     // 先把顶点和法线都转到视空间，一次算完复用
     V3 view_v[8];
     for (int i = 0; i < 8; i++) {
-        view_v[i] = Rotate(kVerts[i], s_pitch, s_roll, s_yaw);
+        view_v[i] = Cam(Rotate(kVerts[i], s_pitch, s_roll, s_yaw));
     }
 
     struct Visible {
@@ -224,8 +259,8 @@ void Render() {
     int vis_count = 0;
 
     for (int f = 0; f < 6; f++) {
-        V3 n = Rotate(kFaces[f].normal, s_pitch, s_roll, s_yaw);
-        V3 c = Rotate(kFaces[f].center, s_pitch, s_roll, s_yaw);
+        V3 n = Cam(Rotate(kFaces[f].normal, s_pitch, s_roll, s_yaw));
+        V3 c = Cam(Rotate(kFaces[f].center, s_pitch, s_roll, s_yaw));
         // 相机在 (0,0,+kDist) 朝 -z 看，所以"相机→面心"是 c-(0,0,kDist)。
         // 外法线与这个向量夹角大于 90°（点积为负）才朝向相机。
         float cx = c.x, cy = c.y, cz = c.z - kDist;
@@ -251,7 +286,7 @@ void Render() {
     for (int k = 0; k < vis_count; k++) {
         const Face& face = kFaces[vis[k].face];
 
-        V3 n = Rotate(face.normal, s_pitch, s_roll, s_yaw);
+        V3 n = Cam(Rotate(face.normal, s_pitch, s_roll, s_yaw));
         float lambert = n.x * light.x + n.y * light.y + n.z * light.z;
         if (lambert < 0.0f) lambert = 0.0f;
         // 环境光 0.42 + 漫反射 0.58：侧脸不至于全黑，又能看出三个面的明暗差
@@ -282,7 +317,7 @@ void Render() {
                 face.center.y + face.u.y * pos[i][0] + face.v.y * pos[i][1],
                 face.center.z + face.u.z * pos[i][0] + face.v.z * pos[i][1],
             };
-            P2 center_p = Project(Rotate(ctr, s_pitch, s_roll, s_yaw));
+            P2 center_p = Project(Cam(Rotate(ctr, s_pitch, s_roll, s_yaw)));
             if (kPipRadius * center_p.s < 0.7f) {
                 continue;  // 太小了，画出来只是噪点
             }
@@ -297,13 +332,114 @@ void Render() {
                     ctr.y + face.u.y * du + face.v.y * dv,
                     ctr.z + face.u.z * du + face.v.z * dv,
                 };
-                ring[k2] = Project(Rotate(pt, s_pitch, s_roll, s_yaw));
+                ring[k2] = Project(Cam(Rotate(pt, s_pitch, s_roll, s_yaw)));
             }
             for (int k2 = 0; k2 < 12; k2++) {
                 FillTri(center_p, ring[k2], ring[(k2 + 1) % 12], pip_color);
             }
         }
     }
+}
+
+// ── 掷骰：落点与动画 ──────────────────────────────────────────────────
+// 六个"某一面正对镜头"的姿态。相机在 (0,0,+kDist) 看 -z，
+// 所以正对镜头的是被转到 +z 的那一面；点数按真骰子规则（对面之和为 7）。
+//   +z=1  -z=6  +x=3  -x=4  +y=5  -y=2
+struct Landing {
+    float pitch, roll, yaw;
+    int pips;
+};
+
+const Landing kLandings[6] = {
+    {0, 0, 0, 1},      // 1 点面本来就在 +z
+    {180, 0, 0, 6},    // -z 面绕 X 翻 180°
+    {0, 0, -90, 3},    // +x 面绕 Y 转 -90°
+    {0, 0, 90, 4},     // -x 面绕 Y 转 +90°
+    {90, 0, 0, 5},     // +y 面绕 X 转 +90°
+    {-90, 0, 0, 2},    // -y 面绕 X 转 -90°
+};
+
+// 折回 (-180, 180]，避免角度越累越大、最后 float 掉精度
+float NormDeg(float a) {
+    a = fmodf(a, 360.0f);
+    if (a > 180.0f) a -= 360.0f;
+    if (a <= -180.0f) a += 360.0f;
+    return a;
+}
+
+// 从 from 转到 land，路上至少正向转 turns 圈。
+// 加的全是 360 的整数倍，所以终点朝向和 land 完全一致，只是多绕了几圈。
+float Plan(float from, float land, int turns) {
+    float to = land;
+    const float need = from + (float)turns * 360.0f;
+    while (to < need) to += 360.0f;
+    return to;
+}
+
+uint32_t NowMs() {
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+// 每帧推一次角度，返回 true 表示这一帧画面需要重绘。
+// 静止时不重绘——骰子停下来以后没必要还按 25fps 刷 SPI。
+bool AdvanceRoll() {
+    bool req;
+    float rp = 0, rr = 0, ry = 0;
+    int turns = 1;
+
+    portENTER_CRITICAL(&s_mux);
+    req = s_req;
+    if (req) {
+        s_req = false;
+        rp = s_req_pitch;
+        rr = s_req_roll;
+        ry = s_req_yaw;
+        turns = s_req_turns;
+    }
+    portEXIT_CRITICAL(&s_mux);
+
+    if (req) {
+        // 起点由渲染任务自己取当前角度：Roll() 那边不用读 s_pitch，省掉一次竞态
+        s_from_pitch = s_pitch;
+        s_from_roll = s_roll;
+        s_from_yaw = s_yaw;
+        s_to_pitch = Plan(s_pitch, rp, turns);
+        s_to_roll = Plan(s_roll, rr, turns);
+        s_to_yaw = Plan(s_yaw, ry, turns);
+        s_roll_start_ms = NowMs();
+
+        portENTER_CRITICAL(&s_mux);
+        s_phase = Phase::kRolling;
+        portEXIT_CRITICAL(&s_mux);
+        return true;  // 让节奏从这一帧开始对齐，下一帧才真正推进
+    }
+
+    Phase phase;
+    portENTER_CRITICAL(&s_mux);
+    phase = s_phase;
+    portEXIT_CRITICAL(&s_mux);
+    if (phase != Phase::kRolling) {
+        return false;
+    }
+
+    const float t = (float)(NowMs() - s_roll_start_ms) / (float)kRollMs;
+    if (t >= 1.0f) {
+        // 停稳：终点和落点差 360 的整数倍，折回后视觉上完全一致
+        s_pitch = NormDeg(s_to_pitch);
+        s_roll = NormDeg(s_to_roll);
+        s_yaw = NormDeg(s_to_yaw);
+        portENTER_CRITICAL(&s_mux);
+        s_phase = Phase::kIdle;
+        portEXIT_CRITICAL(&s_mux);
+        return true;
+    }
+
+    // easeOutCubic：开头快、末段速度趋于 0，看起来就是"滚着滚着停下来"
+    const float e = 1.0f - powf(1.0f - t, 3.0f);
+    s_pitch = s_from_pitch + (s_to_pitch - s_from_pitch) * e;
+    s_roll = s_from_roll + (s_to_roll - s_from_roll) * e;
+    s_yaw = s_from_yaw + (s_to_yaw - s_from_yaw) * e;
+    return true;
 }
 
 // ── 后台渲染任务 ──────────────────────────────────────────────────────
@@ -315,15 +451,18 @@ void RenderTask(void*) {
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
+        bool drew = false;
         {
             // 所有 LVGL 调用必须在锁里做，否则会和 UI 任务抢 lvgl 内部状态
             DisplayLockGuard lock(s_display);
-            s_yaw += kSpinDegPerFrame;  // 第 1 轮固定自转；接上 IMU 后改由 SetAttitude 驱动
-            if (s_yaw > 360.0f) s_yaw -= 360.0f;
-            Render();
-            lv_obj_invalidate(s_canvas);
+            if (AdvanceRoll()) {
+                Render();
+                lv_obj_invalidate(s_canvas);
+                drew = true;
+            }
         }
-        vTaskDelay(pdMS_TO_TICKS(kFrameMs));
+        // 翻滚中按 25fps 刷；停稳后退回 10Hz 空转等下一次掷骰
+        vTaskDelay(pdMS_TO_TICKS(drew ? kFrameMs : 100));
     }
 }
 
@@ -461,6 +600,32 @@ void Hide() {
 
 bool IsVisible() {
     return s_visible;
+}
+
+int Roll() {
+    if (s_buf == nullptr) {
+        ESP_LOGW(TAG, "还没初始化，掷不了");
+        return 0;
+    }
+    Show();  // 没显示就先显示出来，掷骰子看不到画面没意义
+
+    const Landing& land = kLandings[esp_random() % 6];
+    // 面内再随机转 0/90/180/270：同一个点数每次的图案朝向不同，不那么像"重播"
+    const float roll_extra = 90.0f * (float)(esp_random() % 4);
+    const int turns = 1 + (int)(esp_random() % 2);  // 1~2 圈
+
+    portENTER_CRITICAL(&s_mux);
+    s_req_pitch = land.pitch;
+    s_req_roll = land.roll + roll_extra;
+    s_req_yaw = land.yaw;
+    s_req_turns = turns;
+    s_req = true;
+    portEXIT_CRITICAL(&s_mux);
+
+    // 注意 printf 不支持 %f（CONFIG_NEWLIB_NANO_FORMAT），日志一律转整数
+    ESP_LOGI(TAG, "掷骰子：落点 %d 点（pitch=%d roll=%d yaw=%d，转 %d 圈）", land.pips,
+             (int)land.pitch, (int)(land.roll + roll_extra), (int)land.yaw, turns);
+    return land.pips;
 }
 
 void SetAttitude(float pitch, float roll, float yaw) {
