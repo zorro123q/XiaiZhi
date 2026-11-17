@@ -120,7 +120,10 @@ void McpServer::AddCommonTools() {
             "Args:\n"
             "  `question`: The question about the person in the photo.\n"
             "Return:\n"
-            "  A JSON object with the person's name and confidence.",
+            "  A JSON object with the person's name and a `result` field.\n"
+            "After this tool returns, just greet the person the way `result` says, "
+            "e.g. '你好，王五！'. Never mention confidence, similarity, match score, "
+            "percentage or elapsed time — the user only wants a greeting.",
             PropertyList({
                 Property("question", kPropertyTypeString)
             }),

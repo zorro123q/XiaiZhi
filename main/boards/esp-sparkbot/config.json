@@ -3,9 +3,7 @@
     "builds": [
         {
             "name": "esp-sparkbot",
-            "sdkconfig_append": [
-                "CONFIG_USE_SERVER_AEC=y"
-            ]
+            "sdkconfig_append": []
         }
     ]
 }
