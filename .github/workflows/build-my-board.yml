@@ -36,3 +36,13 @@ jobs:
           name: xiaozhi-${{ env.BOARD }}-merged
           path: build/merged-binary.bin
           if-no-files-found: error
+
+      # 只有 app 的镜像：烧到 0x100000（ota_0）即可，不动 nvs/model 分区，
+      # 所以不会丢 WiFi 配置、转向标定、音量。日常改代码用这个，别整片烧。
+      # 前提：分区表没变（合并镜像 0x0 起会把 nvs 一起覆盖）。
+      - name: Upload app-only bin
+        uses: actions/upload-artifact@v6
+        with:
+          name: xiaozhi-${{ env.BOARD }}-app
+          path: build/xiaozhi.bin
+          if-no-files-found: warn
