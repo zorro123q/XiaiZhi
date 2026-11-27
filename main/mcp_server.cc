@@ -91,7 +91,7 @@ void McpServer::AddCommonTools() {
     if (camera) {
         // 本地人脸识别服务地址。优先级：NVS（可用语音改）> 下面的默认值。
         // 换网络/换主机时不用再重刷固件，说一句「识别服务地址改成 192.168.1.20:8001」就行。
-        static const char* kDefaultFaceUrl = "http://172.20.11.63:8001/recognize";
+        static const char* kDefaultFaceUrl = "http://192.168.100.230:8001/recognize";
         Settings face_settings("face", false);
         std::string face_url = face_settings.GetString("url", kDefaultFaceUrl);
         ESP_LOGI(TAG, "Face service url: %s", face_url.c_str());
