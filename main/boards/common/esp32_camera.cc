@@ -338,14 +338,32 @@ std::string Esp32Camera::IdentifyPerson(const std::string& question) {
     std::string result = PostImage(face_url_, question);
 
     // 识别失败（大多数情况是镜头前没人）。这时候模型很容易拿「没检测到人脸」
-    // 去回答「你能认出哪些人」这类能力询问，所以顺手塞一条出路给它。
+    // 去回答「你能认出哪些人」这类能力询问，所以顺手把名单也查出来一起给它，
+    // 这样即使它调错了工具，也还能把问题答对。
     if (result.find("\"success\":false") != std::string::npos ||
         result.find("\"success\": false") != std::string::npos) {
-        auto pos = result.rfind('}');
-        if (pos != std::string::npos) {
-            result.insert(pos,
-                ", \"hint\": \"如果用户只是想知道你能认出哪些人（而不是让你认画面里的人），"
-                "请改调 self.camera.list_known_people 查询登记名单，不要反复拍照。\"");
+        cJSON* obj = cJSON_Parse(result.c_str());
+        if (obj != nullptr) {
+            std::string people;
+            int people_count = 0;
+            if (FetchKnownPeopleText(people, people_count)) {
+                // 关键：直接把 result 换成名单本身。模型最容易照着 result 念，
+                // 挂成附加字段它经常视而不见。
+                std::string merged_text = "镜头前没有看到人。不过" + people;
+                cJSON_DeleteItemFromObject(obj, "result");
+                cJSON_AddStringToObject(obj, "result", merged_text.c_str());
+                cJSON_AddStringToObject(obj, "known_people", people.c_str());
+                cJSON_AddNumberToObject(obj, "known_people_count", people_count);
+            }
+            cJSON_AddStringToObject(obj, "hint",
+                "如果用户只是想知道你能认出哪些人（而不是让你认画面里的人），"
+                "请改调 self.camera.list_known_people 查询登记名单，不要反复拍照。");
+            char* out = cJSON_PrintUnformatted(obj);
+            if (out != nullptr) {
+                result = out;
+                cJSON_free(out);
+            }
+            cJSON_Delete(obj);
         }
     }
     return result;
@@ -354,9 +372,10 @@ std::string Esp32Camera::IdentifyPerson(const std::string& question) {
 // 列出人脸库里已登记的人名。
 // 人脸库只存在服务端，设备和大模型都没有副本，所以「你能认出谁」这种问题
 // 只能实时拉一次 /list 才有答案，不能靠模型自己回忆。
-std::string Esp32Camera::ListKnownPeople() {
+bool Esp32Camera::FetchKnownPeopleText(std::string& text, int& count) {
+    count = 0;
     if (face_url_.empty()) {
-        return "{\"success\": false, \"message\": \"人脸识别服务地址未配置\"}";
+        return false;
     }
 
     // face_url_ 形如 http://192.168.100.230:8001/recognize，换成同目录的 /list
@@ -373,13 +392,13 @@ std::string Esp32Camera::ListKnownPeople() {
     auto http = network->CreateHttp(3);
     if (!http->Open("GET", url)) {
         ESP_LOGE(TAG, "Failed to connect to %s", url.c_str());
-        return "{\"success\": false, \"message\": \"连不上人脸识别服务\"}";
+        return false;
     }
     int status = http->GetStatusCode();
     if (status != 200) {
         ESP_LOGE(TAG, "List people failed, status=%d", status);
         http->Close();
-        return "{\"success\": false, \"message\": \"人脸识别服务返回错误\"}";
+        return false;
     }
     std::string body = http->ReadAll();
     http->Close();
@@ -388,14 +407,13 @@ std::string Esp32Camera::ListKnownPeople() {
     // 服务端返回 {"users":["张三","李四"],"count":2}
     cJSON* root = cJSON_Parse(body.c_str());
     if (root == nullptr) {
-        return "{\"success\": false, \"message\": \"人脸库返回格式异常\"}";
+        return false;
     }
     cJSON* users = cJSON_GetObjectItem(root, "users");
-    int count = cJSON_IsArray(users) ? cJSON_GetArraySize(users) : 0;
+    int n = cJSON_IsArray(users) ? cJSON_GetArraySize(users) : 0;
 
     std::string names;
-    int real_count = 0;
-    for (int i = 0; i < count; i++) {
+    for (int i = 0; i < n; i++) {
         cJSON* item = cJSON_GetArrayItem(users, i);
         if (!cJSON_IsString(item) || item->valuestring == nullptr) {
             continue;
@@ -404,23 +422,31 @@ std::string Esp32Camera::ListKnownPeople() {
             names += "、";
         }
         names += item->valuestring;
-        real_count++;
+        count++;
     }
     cJSON_Delete(root);
 
     // 直接给一句能念出来的中文，省得模型去啃原始 JSON
-    std::string result;
-    if (real_count == 0) {
-        result = "人脸库里现在还没有登记任何人，先在管理页给别人录一张照片吧。";
+    if (count == 0) {
+        text = "人脸库里现在还没有登记任何人，先在管理页给别人录一张照片吧。";
     } else {
-        result = "人脸库里现在登记了 " + std::to_string(real_count) + " 个人：" + names +
-                 "。这些都是你能认出来的人。";
+        text = "人脸库里现在登记了 " + std::to_string(count) + " 个人：" + names +
+               "。这些都是你能认出来的人。";
+    }
+    return true;
+}
+
+std::string Esp32Camera::ListKnownPeople() {
+    std::string text;
+    int count = 0;
+    if (!FetchKnownPeopleText(text, count)) {
+        return "{\"success\": false, \"message\": \"连不上人脸识别服务，请确认那台机器的 8001 端口能访问\"}";
     }
 
     cJSON* resp = cJSON_CreateObject();
     cJSON_AddBoolToObject(resp, "success", true);
-    cJSON_AddNumberToObject(resp, "count", real_count);
-    cJSON_AddStringToObject(resp, "result", result.c_str());
+    cJSON_AddNumberToObject(resp, "count", count);
+    cJSON_AddStringToObject(resp, "result", text.c_str());
     char* out = cJSON_PrintUnformatted(resp);
     std::string ret = out != nullptr ? out : "{\"success\": false, \"message\": \"out of memory\"}";
     if (out != nullptr) {

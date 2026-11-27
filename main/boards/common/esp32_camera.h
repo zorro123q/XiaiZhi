@@ -27,6 +27,8 @@ private:
 
     // 把当前帧 POST 到指定 URL（Explain 与 IdentifyPerson 共用）
     std::string PostImage(const std::string& url, const std::string& question);
+    // 拉一次人脸库名单，返回一句可直接念的中文；失败返回 false
+    bool FetchKnownPeopleText(std::string& text, int& count);
 
 public:
     Esp32Camera(const camera_config_t& config);
