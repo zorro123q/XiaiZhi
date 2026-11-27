@@ -335,7 +335,20 @@ std::string Esp32Camera::IdentifyPerson(const std::string& question) {
     if (face_url_.empty()) {
         return "{\"success\": false, \"message\": \"Face recognition URL is not set\"}";
     }
-    return PostImage(face_url_, question);
+    std::string result = PostImage(face_url_, question);
+
+    // 识别失败（大多数情况是镜头前没人）。这时候模型很容易拿「没检测到人脸」
+    // 去回答「你能认出哪些人」这类能力询问，所以顺手塞一条出路给它。
+    if (result.find("\"success\":false") != std::string::npos ||
+        result.find("\"success\": false") != std::string::npos) {
+        auto pos = result.rfind('}');
+        if (pos != std::string::npos) {
+            result.insert(pos,
+                ", \"hint\": \"如果用户只是想知道你能认出哪些人（而不是让你认画面里的人），"
+                "请改调 self.camera.list_known_people 查询登记名单，不要反复拍照。\"");
+        }
+    }
+    return result;
 }
 
 // 列出人脸库里已登记的人名。
