@@ -13,6 +13,7 @@
 #include "application.h"
 #include "display.h"
 #include "board.h"
+#include "settings.h"
 
 #define TAG "MCP"
 
@@ -88,8 +89,13 @@ void McpServer::AddCommonTools() {
 
     auto camera = board.GetCamera();
     if (camera) {
-        // 本地人脸识别服务地址：改成你运行 face_server.py 那台电脑的局域网 IP
-        camera->SetFaceRecognizeUrl("http://192.168.100.230:8001/recognize");
+        // 本地人脸识别服务地址。优先级：NVS（可用语音改）> 下面的默认值。
+        // 换网络/换主机时不用再重刷固件，说一句「识别服务地址改成 192.168.1.20:8001」就行。
+        static const char* kDefaultFaceUrl = "http://172.20.11.63:8001/recognize";
+        Settings face_settings("face", false);
+        std::string face_url = face_settings.GetString("url", kDefaultFaceUrl);
+        ESP_LOGI(TAG, "Face service url: %s", face_url.c_str());
+        camera->SetFaceRecognizeUrl(face_url);
 
         AddTool("self.camera.take_photo",
             "Take a photo and explain it. Use this tool after the user asks you to see something.\n"
@@ -151,6 +157,36 @@ void McpServer::AddCommonTools() {
                 // 纯 GET 请求，不取帧；同样把优先级降下来，别和 AFE 抢 CPU
                 TaskPriorityReset priority_reset(1);
                 return camera->ListKnownPeople();
+            });
+
+        // 换网络后服务地址会变，做成可用语音修改的，省得每次重刷固件
+        AddTool("self.camera.set_face_service_url",
+            "Set the address of the local face recognition service. "
+            "Use this only when the user explicitly gives a new host or IP, e.g. "
+            "'识别服务地址改成 192.168.1.20:8001'.\n"
+            "Args:\n"
+            "  `url`: host:port 或完整地址，缺少 http:// 和 /recognize 会自动补全。\n"
+            "Return:\n"
+            "  The address actually saved.",
+            PropertyList({
+                Property("url", kPropertyTypeString)
+            }),
+            [camera](const PropertyList& properties) -> ReturnValue {
+                std::string url = properties["url"].value<std::string>();
+                if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) {
+                    url = "http://" + url;
+                }
+                if (url.find("/recognize") == std::string::npos) {
+                    while (!url.empty() && url.back() == '/') {
+                        url.pop_back();
+                    }
+                    url += "/recognize";
+                }
+                Settings settings("face", true);
+                settings.SetString("url", url);
+                camera->SetFaceRecognizeUrl(url);
+                ESP_LOGI(TAG, "Face service url updated to %s", url.c_str());
+                return "{\"success\": true, \"url\": \"" + url + "\"}";
             });
     }
 
