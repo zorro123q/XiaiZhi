@@ -96,18 +96,18 @@ void McpServer::AddCommonTools() {
         std::string face_url = face_settings.GetString("url", kDefaultFaceUrl);
         ESP_LOGI(TAG, "Face service url: %s", face_url.c_str());
         camera->SetFaceRecognizeUrl(face_url);
+        // 启动标记：看到这一行才说明刷的是带 list_known_people 的新固件
+        ESP_LOGI(TAG, "Face tools: identify_person + list_known_people + set_face_service_url (rev 3)");
 
         AddTool("self.camera.take_photo",
-            "Take a photo and explain it. Use this tool after the user asks you to see something.\n"
-            "If the user is asking about a person's identity (e.g. 'who is this', '这是谁'), "
-            "use self.camera.identify_person instead.\n"
-            "If the user is only asking which people you can recognize ('你能认出哪些人', '你认识谁'), "
-            "that is a question about the face database, NOT something you can see — "
-            "use self.camera.list_known_people and do not take a photo.\n"
+            "拍照并描述画面。用户让你看东西、问「这是什么」「前面有什么」时使用。\n"
+            "如果用户问的是「镜头前这个人是谁」，请用 self.camera.identify_person。\n"
+            "如果用户问的是「你能认出哪些人」「你认识谁」「人脸库里有哪些人」，"
+            "那是在问人脸库名单，不是在看画面——请用 self.camera.list_known_people，不要拍照。\n"
             "Args:\n"
-            "  `question`: The question that you want to ask about the photo.\n"
+            "  `question`: 你想问这张照片的问题。\n"
             "Return:\n"
-            "  A JSON object that provides the photo information.",
+            "  包含照片信息的 JSON。",
             PropertyList({
                 Property("question", kPropertyTypeString)
             }),
@@ -123,21 +123,17 @@ void McpServer::AddCommonTools() {
             });
 
         AddTool("self.camera.identify_person",
-            "Recognize the identity of the person in the photo. "
-            "Use this tool when the user asks who someone is, e.g. '这是谁', '看看这个人是谁', "
-            "'他是谁', '认不认识这个人'.\n"
-            "IMPORTANT: this tool requires a real person standing in front of the camera. "
-            "If the user is asking which people you can recognize in general "
-            "('你能认出哪些人', '你都认识谁', '认识哪些人'), that is NOT this tool — "
-            "call self.camera.list_known_people instead, otherwise you will only get "
-            "'no face detected' and answer the wrong question.\n"
+            "认出镜头前站着的那个人是谁。用户问「这是谁」「看看这个人是谁」「他是谁」"
+            "「认不认识这个人」「你认识他吗」时使用。\n"
+            "注意：本工具必须有真人站在镜头前。如果用户问的是一般性的「你能认出哪些人」"
+            "「你都认识谁」「认识哪些人」，那不是本工具，请改调 self.camera.list_known_people，"
+            "否则只会拿到「没有检测到人脸」并答错问题。\n"
             "Args:\n"
-            "  `question`: The question about the person in the photo.\n"
+            "  `question`: 关于照片里这个人的问题。\n"
             "Return:\n"
-            "  A JSON object with the person's name and a `result` field.\n"
-            "After this tool returns, just greet the person the way `result` says, "
-            "e.g. '你好，王五！'. Never mention confidence, similarity, match score, "
-            "percentage or elapsed time — the user only wants a greeting.",
+            "  含人名和 `result` 字段的 JSON。\n"
+            "本工具返回后，照着 `result` 打招呼就行，例如「你好，王五！」。"
+            "绝不要说置信度、相似度、匹配分数、百分比或耗时——用户只想听一句招呼。",
             PropertyList({
                 Property("question", kPropertyTypeString)
             }),
@@ -153,16 +149,15 @@ void McpServer::AddCommonTools() {
 
         // 人脸库名单在服务端，模型上下文里没有，所以「你能认出谁」必须查一次。
         AddTool("self.camera.list_known_people",
-            "List the people enrolled in the local face recognition database. "
-            "This is a pure query — no photo, no camera, no person needed in front of you.\n"
-            "Use this tool whenever the user asks which people you can recognize, e.g. "
-            "'你能认出哪些人', '你都认识谁', '认识哪些人', '人脸库里有谁', '你有没有我的资料'.\n"
-            "Do NOT call self.camera.identify_person for these questions — that one needs a real face "
-            "in the camera and will just answer 'no face detected'.\n"
+            "查询本地人脸库里登记了哪些人。纯查询：不用拍照、不占摄像头、镜头前不需要有人。\n"
+            "只要用户问「你能认出哪些人」「你都认识谁」「认识哪些人」「人脸库里有谁」"
+            "「有没有我的资料」「你还记得谁」，**必须立刻调用本工具查一次再回答**，"
+            "不要凭印象回答，也不要直接说自己查不到、没有名单。\n"
+            "严禁用 self.camera.identify_person 回答这类问题——那个需要真人站在镜头前，"
+            "只会返回「没有检测到人脸」。\n"
             "Return:\n"
-            "  A JSON object with `count` and a `result` field already written in natural Chinese. "
-            "Answer by reading `result` out loud — do not dump raw JSON, and never invent names "
-            "that are not in it.",
+            "  含 `count` 和 `result` 字段的 JSON。`result` 已经是能直接念出来的中文，"
+            "照着它回答就行；不要念原始 JSON，也不要编造里面没有的名字。",
             PropertyList(),
             [camera](const PropertyList&) -> ReturnValue {
                 // 纯 GET 请求，不取帧；同样把优先级降下来，别和 AFE 抢 CPU
