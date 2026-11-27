@@ -148,16 +148,32 @@ void McpServer::AddCommonTools() {
             });
 
         // 人脸库名单在服务端，模型上下文里没有，所以「你能认出谁」必须查一次。
-        AddTool("self.camera.list_known_people",
+        // 但模型经常一个工具都不调、直接空口说「查不到」，所以这里在注册工具时
+        // 就把名单拉一次写进描述 —— 工具描述是设备端唯一能进入模型上下文的文本。
+        std::string known_names = camera->KnownPeopleNames();
+        if (!known_names.empty()) {
+            ESP_LOGI(TAG, "Preloaded known people into tool description: %s", known_names.c_str());
+        } else {
+            ESP_LOGW(TAG, "No known people preloaded (service offline or empty database)");
+        }
+
+        std::string list_desc =
             "查询本地人脸库里登记了哪些人。纯查询：不用拍照、不占摄像头、镜头前不需要有人。\n"
-            "只要用户问「你能认出哪些人」「你都认识谁」「认识哪些人」「人脸库里有谁」"
-            "「有没有我的资料」「你还记得谁」，**必须立刻调用本工具查一次再回答**，"
+            "只要用户问「你能认出哪些人」「你都认识谁」「认识哪些人」「你有哪些熟悉的人」"
+            "「人脸库里有谁」「有没有我的资料」「你还记得谁」，**必须立刻调用本工具查一次再回答**，"
             "不要凭印象回答，也不要直接说自己查不到、没有名单。\n"
             "严禁用 self.camera.identify_person 回答这类问题——那个需要真人站在镜头前，"
-            "只会返回「没有检测到人脸」。\n"
+            "只会返回「没有检测到人脸」。\n";
+        if (!known_names.empty()) {
+            list_desc += "本设备启动时读到的人脸库名单：" + known_names +
+                         "。用户问你能认出谁时，直接说这几个人就行。\n";
+        }
+        list_desc +=
             "Return:\n"
             "  含 `count` 和 `result` 字段的 JSON。`result` 已经是能直接念出来的中文，"
-            "照着它回答就行；不要念原始 JSON，也不要编造里面没有的名字。",
+            "照着它回答就行；不要念原始 JSON，也不要编造里面没有的名字。";
+
+        AddTool("self.camera.list_known_people", list_desc,
             PropertyList(),
             [camera](const PropertyList&) -> ReturnValue {
                 // 纯 GET 请求，不取帧；同样把优先级降下来，别和 AFE 抢 CPU

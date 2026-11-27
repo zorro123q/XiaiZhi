@@ -23,6 +23,11 @@ public:
     virtual std::string ListKnownPeople() {
         return "{\"success\": false, \"message\": \"Face recognition not supported\"}";
     }
+    // 只取人名串（形如「廉梦奇、朱一凡」），用于拼进 MCP 工具描述。
+    // 拿不到就返回空串，调用方据此降级，不要报错。
+    virtual std::string KnownPeopleNames() {
+        return "";
+    }
     // 抓一帧并编码为 JPEG，用于网页实时预览。
     // 返回 malloc 申请的缓冲区，调用方负责 free；失败返回 nullptr。
     virtual uint8_t* SnapshotJpeg(size_t* out_len, int quality = 70) {

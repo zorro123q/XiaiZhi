@@ -29,6 +29,8 @@ private:
     std::string PostImage(const std::string& url, const std::string& question);
     // 拉一次人脸库名单，返回一句可直接念的中文；失败返回 false
     bool FetchKnownPeopleText(std::string& text, int& count);
+    // 只拉人名串，失败返回 false
+    bool FetchKnownPeopleNames(std::string& names, int& count);
 
 public:
     Esp32Camera(const camera_config_t& config);
@@ -44,6 +46,7 @@ public:
     virtual std::string IdentifyPerson(const std::string& question) override;
     // 拉取人脸库名单：GET <face_url 同目录>/list，返回给大模型直接念的中文
     virtual std::string ListKnownPeople() override;
+    virtual std::string KnownPeopleNames() override;
     // 抓一帧转 JPEG（网页实时预览用），返回 malloc 缓冲区，调用方 free
     virtual uint8_t* SnapshotJpeg(size_t* out_len, int quality = 70) override;
 

@@ -372,7 +372,8 @@ std::string Esp32Camera::IdentifyPerson(const std::string& question) {
 // 列出人脸库里已登记的人名。
 // 人脸库只存在服务端，设备和大模型都没有副本，所以「你能认出谁」这种问题
 // 只能实时拉一次 /list 才有答案，不能靠模型自己回忆。
-bool Esp32Camera::FetchKnownPeopleText(std::string& text, int& count) {
+bool Esp32Camera::FetchKnownPeopleNames(std::string& names, int& count) {
+    names.clear();
     count = 0;
     if (face_url_.empty()) {
         return false;
@@ -412,7 +413,6 @@ bool Esp32Camera::FetchKnownPeopleText(std::string& text, int& count) {
     cJSON* users = cJSON_GetObjectItem(root, "users");
     int n = cJSON_IsArray(users) ? cJSON_GetArraySize(users) : 0;
 
-    std::string names;
     for (int i = 0; i < n; i++) {
         cJSON* item = cJSON_GetArrayItem(users, i);
         if (!cJSON_IsString(item) || item->valuestring == nullptr) {
@@ -425,6 +425,14 @@ bool Esp32Camera::FetchKnownPeopleText(std::string& text, int& count) {
         count++;
     }
     cJSON_Delete(root);
+    return true;
+}
+
+bool Esp32Camera::FetchKnownPeopleText(std::string& text, int& count) {
+    std::string names;
+    if (!FetchKnownPeopleNames(names, count)) {
+        return false;
+    }
 
     // 直接给一句能念出来的中文，省得模型去啃原始 JSON
     if (count == 0) {
@@ -434,6 +442,16 @@ bool Esp32Camera::FetchKnownPeopleText(std::string& text, int& count) {
                "。这些都是你能认出来的人。";
     }
     return true;
+}
+
+// 供 MCP 初始化时把名单直接写进工具描述，让模型不用调用就知道答案
+std::string Esp32Camera::KnownPeopleNames() {
+    std::string names;
+    int count = 0;
+    if (!FetchKnownPeopleNames(names, count) || count == 0) {
+        return "";
+    }
+    return names;
 }
 
 std::string Esp32Camera::ListKnownPeople() {
