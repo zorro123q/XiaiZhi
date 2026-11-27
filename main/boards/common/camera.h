@@ -18,6 +18,11 @@ public:
     virtual std::string IdentifyPerson(const std::string& question) {
         return "{\"success\": false, \"message\": \"Face recognition not supported\"}";
     }
+    // 列出人脸库里已登记的人名（默认不支持）。
+    // 大模型看不见人脸库，被问「你能认出谁」时必须靠这个工具拿准确名单。
+    virtual std::string ListKnownPeople() {
+        return "{\"success\": false, \"message\": \"Face recognition not supported\"}";
+    }
     // 抓一帧并编码为 JPEG，用于网页实时预览。
     // 返回 malloc 申请的缓冲区，调用方负责 free；失败返回 nullptr。
     virtual uint8_t* SnapshotJpeg(size_t* out_len, int quality = 70) {

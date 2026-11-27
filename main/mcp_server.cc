@@ -136,6 +136,22 @@ void McpServer::AddCommonTools() {
                 auto question = properties["question"].value<std::string>();
                 return camera->IdentifyPerson(question);
             });
+
+        // 人脸库名单在服务端，模型上下文里没有，所以「你能认出谁」必须查一次。
+        AddTool("self.camera.list_known_people",
+            "List the people enrolled in the local face recognition database. "
+            "Use this tool when the user asks who you can recognize, e.g. '你能认出哪些人', "
+            "'你都认识谁', '人脸库里有谁', '你有没有我的资料'.\n"
+            "Return:\n"
+            "  A JSON object with `count` and a `result` field already written in natural Chinese. "
+            "Answer by reading `result` out loud — do not dump raw JSON, and never invent names "
+            "that are not in it.",
+            PropertyList(),
+            [camera](const PropertyList&) -> ReturnValue {
+                // 纯 GET 请求，不取帧；同样把优先级降下来，别和 AFE 抢 CPU
+                TaskPriorityReset priority_reset(1);
+                return camera->ListKnownPeople();
+            });
     }
 
     // Restore the original tools list to the end of the tools list

@@ -7,6 +7,7 @@
 #include <esp_log.h>
 #include <esp_heap_caps.h>
 #include <img_converters.h>
+#include <cJSON.h>
 #include <cstring>
 
 #define TAG "Esp32Camera"
@@ -335,6 +336,85 @@ std::string Esp32Camera::IdentifyPerson(const std::string& question) {
         return "{\"success\": false, \"message\": \"Face recognition URL is not set\"}";
     }
     return PostImage(face_url_, question);
+}
+
+// 列出人脸库里已登记的人名。
+// 人脸库只存在服务端，设备和大模型都没有副本，所以「你能认出谁」这种问题
+// 只能实时拉一次 /list 才有答案，不能靠模型自己回忆。
+std::string Esp32Camera::ListKnownPeople() {
+    if (face_url_.empty()) {
+        return "{\"success\": false, \"message\": \"人脸识别服务地址未配置\"}";
+    }
+
+    // face_url_ 形如 http://192.168.100.230:8001/recognize，换成同目录的 /list
+    std::string url = face_url_;
+    const std::string suffix = "/recognize";
+    auto pos = url.rfind(suffix);
+    if (pos != std::string::npos) {
+        url.replace(pos, suffix.size(), "/list");
+    } else {
+        url += "/list";
+    }
+
+    auto network = Board::GetInstance().GetNetwork();
+    auto http = network->CreateHttp(3);
+    if (!http->Open("GET", url)) {
+        ESP_LOGE(TAG, "Failed to connect to %s", url.c_str());
+        return "{\"success\": false, \"message\": \"连不上人脸识别服务\"}";
+    }
+    int status = http->GetStatusCode();
+    if (status != 200) {
+        ESP_LOGE(TAG, "List people failed, status=%d", status);
+        http->Close();
+        return "{\"success\": false, \"message\": \"人脸识别服务返回错误\"}";
+    }
+    std::string body = http->ReadAll();
+    http->Close();
+    ESP_LOGI(TAG, "Known people from %s: %s", url.c_str(), body.c_str());
+
+    // 服务端返回 {"users":["张三","李四"],"count":2}
+    cJSON* root = cJSON_Parse(body.c_str());
+    if (root == nullptr) {
+        return "{\"success\": false, \"message\": \"人脸库返回格式异常\"}";
+    }
+    cJSON* users = cJSON_GetObjectItem(root, "users");
+    int count = cJSON_IsArray(users) ? cJSON_GetArraySize(users) : 0;
+
+    std::string names;
+    int real_count = 0;
+    for (int i = 0; i < count; i++) {
+        cJSON* item = cJSON_GetArrayItem(users, i);
+        if (!cJSON_IsString(item) || item->valuestring == nullptr) {
+            continue;
+        }
+        if (!names.empty()) {
+            names += "、";
+        }
+        names += item->valuestring;
+        real_count++;
+    }
+    cJSON_Delete(root);
+
+    // 直接给一句能念出来的中文，省得模型去啃原始 JSON
+    std::string result;
+    if (real_count == 0) {
+        result = "人脸库里现在还没有登记任何人，先在管理页给别人录一张照片吧。";
+    } else {
+        result = "人脸库里现在登记了 " + std::to_string(real_count) + " 个人：" + names +
+                 "。这些都是你能认出来的人。";
+    }
+
+    cJSON* resp = cJSON_CreateObject();
+    cJSON_AddBoolToObject(resp, "success", true);
+    cJSON_AddNumberToObject(resp, "count", real_count);
+    cJSON_AddStringToObject(resp, "result", result.c_str());
+    char* out = cJSON_PrintUnformatted(resp);
+    std::string ret = out != nullptr ? out : "{\"success\": false, \"message\": \"out of memory\"}";
+    if (out != nullptr) {
+        cJSON_free(out);
+    }
+    cJSON_Delete(resp);
+    return ret;
 }
 
 uint8_t* Esp32Camera::SnapshotJpeg(size_t* out_len, int quality) {
