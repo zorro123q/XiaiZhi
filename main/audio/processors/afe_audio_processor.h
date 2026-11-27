@@ -30,7 +30,8 @@ public:
 
 private:
     EventGroupHandle_t event_group_ = nullptr;
-    esp_afe_sr_iface_t* afe_iface_ = nullptr;
+    // esp-sr >= 2.2 的 esp_afe_handle_from_config() 返回 const 指针
+    const esp_afe_sr_iface_t* afe_iface_ = nullptr;
     esp_afe_sr_data_t* afe_data_ = nullptr;
     std::function<void(std::vector<int16_t>&& data)> output_callback_;
     std::function<void(bool speaking)> vad_state_change_callback_;

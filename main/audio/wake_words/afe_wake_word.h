@@ -36,7 +36,8 @@ public:
 
 private:
     srmodel_list_t *models_ = nullptr;
-    esp_afe_sr_iface_t* afe_iface_ = nullptr;
+    // esp-sr >= 2.2 的 esp_afe_handle_from_config() 返回 const 指针
+    const esp_afe_sr_iface_t* afe_iface_ = nullptr;
     esp_afe_sr_data_t* afe_data_ = nullptr;
     char* wakenet_model_ = NULL;
     std::vector<std::string> wake_words_;
